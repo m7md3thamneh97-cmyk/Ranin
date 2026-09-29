@@ -119,7 +119,7 @@ function startSegments(){
     if(!S.segmentActive||!S.stream?.active)return;
     if(S.uploads.size>=4){S.timer=setTimeout(run,700);return;}
     const mime=mimeChoice(),parts=[];
-    const rec=new MediaRecorder(S.stream,{mimeType:mime,audioBitsPerSecond:64000});
+    const rec=new MediaRecorder(S.stream,{mimeType:mime,audioBitsPerSecond:128000});
     let resolveDone;
     S.segmentDone=new Promise((resolve)=>{resolveDone=resolve;});
     S.recorder=rec;S.segmentStart=performance.now();
