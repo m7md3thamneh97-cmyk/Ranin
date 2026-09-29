@@ -238,6 +238,17 @@ def test_clone_fresh_previews_and_vapi_assistant_reuse_voice(env, monkeypatch):
     behavior = c.post("/api/enrollment/sessions/%s/behavior" % sid, headers=auth(owner), json={"approve": True}).json()
     clone = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True})
     assert clone.status_code == 200 and clone.json()["state"] == "ready"
+    assert clone.json()["voice_version_id"]
+    voice_version_id = clone.json()["voice_version_id"]
+    version_row = app.state.store.one(
+        "SELECT * FROM enrollment_voice_versions WHERE id=?", (voice_version_id,)
+    )
+    manifest = __import__("json").loads(version_row["sample_manifest"])
+    assert version_row["provider_voice_id"] == "voice_test_123456"
+    assert version_row["state"] == "ready"
+    assert manifest["total_ms"] >= 60000
+    assert [x["seq"] for x in manifest["chunks"]] == [0, 1, 2, 3]
+    assert all(len(x["sha256"]) == 64 for x in manifest["chunks"])
     assert fake.clone_calls == 1
     for kind in ["question", "number", "correction"]:
         preview = c.post(
@@ -262,8 +273,13 @@ def test_clone_fresh_previews_and_vapi_assistant_reuse_voice(env, monkeypatch):
     confirm_pattern(c, owner, sid, "later")
     v2 = c.post("/api/enrollment/sessions/%s/behavior" % sid, headers=auth(owner), json={"approve": True}).json()
     assert v2["version"] == 2
-    assert c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True}).json()["reused"] is True
+    reused = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True}).json()
+    assert reused["reused"] is True
+    assert reused["voice_version_id"] == voice_version_id
     assert fake.clone_calls == 1
+    assert app.state.store.one(
+        "SELECT COUNT(*) AS n FROM enrollment_voice_versions WHERE session_id=?", (sid,)
+    )["n"] == 1
 
 
 def test_unknown_clone_outcome_blocks_duplicate_retry(env, monkeypatch):
