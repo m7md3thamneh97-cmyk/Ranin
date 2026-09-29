@@ -17,7 +17,6 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /healthz
-    maxShutdownDelaySeconds: 60
     disk:
       name: raneen-studio-data
       mountPath: /var/data
