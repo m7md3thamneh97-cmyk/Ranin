@@ -353,7 +353,7 @@ def install(app):
         ident = uid()
         try:
             store.execute(
-                "INSERT INTO enrollment_operations VALUES(?,?,?,?,?,NULL,'{}',?,?,?)",
+                "INSERT INTO enrollment_operations VALUES(?,?,?,?,?,NULL,'{}',?,?)",
                 (ident, session_id, kind, op_key, "dispatching", now(), now()),
             )
         except sqlite3.IntegrityError:
@@ -944,7 +944,6 @@ Session id: {ident}
         return {
             "assistant_id": row["assistant_id"],
             "public_key": _safe_public_key(),
-            "widget_src": "https://unpkg.com/@vapi-ai/client-sdk-react/dist/embed/widget.umd.js",
             "max_duration_seconds": 180,
         }
 
@@ -972,3 +971,9 @@ Session id: {ident}
     @app.get("/enroll", include_in_schema=False)
     def enrollment_page():
         return FileResponse(static / "enroll.html")
+
+    @app.get("/vapi-frame", include_in_schema=False)
+    def vapi_frame():
+        # This page is intended to run in a sandboxed iframe without allow-same-origin.
+        # It deliberately receives only Vapi's public browser key + isolated assistant ID.
+        return FileResponse(static / "vapi-frame.html")
