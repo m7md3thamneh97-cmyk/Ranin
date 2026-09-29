@@ -87,7 +87,7 @@ async function connectInterview(){
   const offer=await pc.createOffer();
   await pc.setLocalDescription(offer);
   const r=await fetch("/api/enrollment/sessions/"+S.session+"/webrtc",{method:"POST",credentials:"omit",body:offer.sdp,headers:{Authorization:"Bearer "+S.token,"Content-Type":"application/sdp"}});
-  if(!r.ok){let d="";try{d=(await r.json()).detail||"";}catch{}stopLocalMedia();pc.close();S.pc=null;throw Error(d||("Realtime WebRTC connection failed ("+r.status+")."));}
+  if(!r.ok){let d="";try{d=(await r.json()).detail||"";}catch{}await stopLocalMedia();pc.close();S.pc=null;throw Error(d||("Realtime WebRTC connection failed ("+r.status+")."));}
   await pc.setRemoteDescription({type:"answer",sdp:await r.text()});
   await interviewScreen();
 }
@@ -120,16 +120,21 @@ function startSegments(){
     if(S.uploads.size>=4){S.timer=setTimeout(run,700);return;}
     const mime=mimeChoice(),parts=[];
     const rec=new MediaRecorder(S.stream,{mimeType:mime,audioBitsPerSecond:64000});
+    let resolveDone;
+    S.segmentDone=new Promise((resolve)=>{resolveDone=resolve;});
     S.recorder=rec;S.segmentStart=performance.now();
     rec.ondataavailable=(e)=>{if(e.data?.size)parts.push(e.data);};
-    rec.onstop=()=>{
+    rec.onstop=async()=>{
       const duration=Math.max(250,Math.round(performance.now()-S.segmentStart));
       const blob=new Blob(parts,{type:mime});
       if(S.segmentActive)run();
-      if(!blob.size)return;
-      const seq=S.seq++;
-      const p=uploadChunk(seq,blob,duration).catch((e)=>{flash(e.message);S.segmentActive=false;}).finally(()=>S.uploads.delete(p));
-      S.uploads.add(p);
+      try{
+        if(!blob.size)return;
+        const seq=S.seq++;
+        const p=uploadChunk(seq,blob,duration).catch((e)=>{flash(e.message);S.segmentActive=false;throw e;}).finally(()=>S.uploads.delete(p));
+        S.uploads.add(p);
+        await p;
+      }finally{resolveDone();}
     };
     rec.start();
     S.timer=setTimeout(()=>{if(rec.state==="recording")rec.stop();},3000);
@@ -145,20 +150,27 @@ async function uploadChunk(seq,blob,duration){
   if(q("#captured"))q("#captured").textContent=fmt(st.clean_ms);
   if(q("#progress"))q("#progress").style.width=Math.min(100,st.clean_ms/(20*60*1000)*100)+"%";
 }
-function stopLocalMedia(){
+async function stopLocalMedia(){
   S.segmentActive=false;clearTimeout(S.timer);
+  const finalSegment=S.segmentDone;
   if(S.recorder?.state==="recording")S.recorder.stop();
-  S.stream?.getTracks().forEach((t)=>t.stop());
-  S.stream=null;
+  try{
+    await Promise.race([
+      finalSegment,
+      new Promise((_,reject)=>setTimeout(()=>reject(Error("Final microphone chunk did not close cleanly.")),5000))
+    ]);
+  }finally{
+    S.stream?.getTracks().forEach((t)=>t.stop());
+    S.stream=null;
+  }
 }
 async function pauseInterview(){
-  stopLocalMedia();
+  try{await stopLocalMedia();}catch(e){flash(e.message);}
   if(S.session&&S.token){
     try{await api("/api/enrollment/sessions/"+S.session+"/webrtc-close",{});}catch(e){flash("Server could not confirm interview hangup; the hard timeout remains active.");}
   }
   if(S.dc?.readyState==="open")S.dc.close();
   S.pc?.close();S.pc=null;S.dc=null;
-  await new Promise((resolve)=>setTimeout(resolve,120));
   await Promise.allSettled([...S.uploads]);S.uploads.clear();
   await interviewScreen();
 }
