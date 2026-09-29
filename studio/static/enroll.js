@@ -69,8 +69,6 @@ async function connectInterview(){
   const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
   S.stream=stream;
   startSegments();
-  let secret;
-  try{secret=await api("/api/enrollment/sessions/"+S.session+"/realtime-secret",{});}catch(e){stopLocalMedia();throw e;}
   const pc=new RTCPeerConnection();
   S.pc=pc;
   const remote=document.createElement("audio");
@@ -88,8 +86,8 @@ async function connectInterview(){
   pc.onconnectionstatechange=()=>{if(["failed","closed","disconnected"].includes(pc.connectionState)&&S.pc===pc)flash("Interview connection ended. Saved microphone chunks remain on the server.");};
   const offer=await pc.createOffer();
   await pc.setLocalDescription(offer);
-  const r=await fetch("https://api.openai.com/v1/realtime/calls",{method:"POST",body:offer.sdp,headers:{Authorization:"Bearer "+secret.value,"Content-Type":"application/sdp"}});
-  if(!r.ok){stopLocalMedia();pc.close();S.pc=null;throw Error("Realtime WebRTC connection failed ("+r.status+").");}
+  const r=await fetch("/api/enrollment/sessions/"+S.session+"/webrtc",{method:"POST",credentials:"omit",body:offer.sdp,headers:{Authorization:"Bearer "+S.token,"Content-Type":"application/sdp"}});
+  if(!r.ok){let d="";try{d=(await r.json()).detail||"";}catch{}stopLocalMedia();pc.close();S.pc=null;throw Error(d||("Realtime WebRTC connection failed ("+r.status+")."));}
   await pc.setRemoteDescription({type:"answer",sdp:await r.text()});
   await interviewScreen();
 }
@@ -155,8 +153,12 @@ function stopLocalMedia(){
 }
 async function pauseInterview(){
   stopLocalMedia();
+  if(S.session&&S.token){
+    try{await api("/api/enrollment/sessions/"+S.session+"/webrtc-close",{});}catch(e){flash("Server could not confirm interview hangup; the hard timeout remains active.");}
+  }
   if(S.dc?.readyState==="open")S.dc.close();
   S.pc?.close();S.pc=null;S.dc=null;
+  await new Promise((resolve)=>setTimeout(resolve,120));
   await Promise.allSettled([...S.uploads]);S.uploads.clear();
   await interviewScreen();
 }
