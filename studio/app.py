@@ -10,6 +10,7 @@ import os
 import secrets
 import sqlite3
 import sys
+import tempfile
 import uuid
 import wave
 import zipfile
@@ -254,7 +255,18 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Cache-Control'] = 'no-store'
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        if request.url.path == '/vapi-frame':
+            response.headers['Content-Security-Policy'] = ("default-src 'none'; script-src 'self' https://unpkg.com; "
+                "style-src 'self' 'unsafe-inline'; connect-src https://api.vapi.ai https://*.vapi.ai wss://*.vapi.ai "
+                "https://*.daily.co wss://*.daily.co; media-src blob: https://*.daily.co; "
+                "img-src data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
+        elif request.url.path == '/enroll':
+            response.headers['Content-Security-Policy'] = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; "
+                "frame-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; "
+                "base-uri 'self'; form-action 'self'")
+        else:
+            response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         response.headers['Permissions-Policy'] = 'microphone=(self), camera=(), geolocation=()'
         return response
 
@@ -382,12 +394,34 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             raise HTTPException(422, 'Invalid capture settings.')
         audio_id = uid()
         path = store.audio_dir / f'{audio_id}.wav'
-        path.write_bytes(data)
+        fd, temp_name = tempfile.mkstemp(prefix='audio-', suffix='.tmp', dir=store.audio_dir)
+        os.close(fd)
+        temp_path = Path(temp_name)
+        temp_path.write_bytes(data)
+        finalized = False
         try:
-            store.execute('INSERT INTO audio VALUES(?,?,?,?,?,?,?)', (audio_id, ident, consent['id'], hashlib.sha256(data).hexdigest(), json.dumps(stats), json.dumps(parsed), now()))
+            # Finalization and consent validation share one write transaction. A
+            # withdrawal that commits first rejects this upload; if this transaction
+            # commits first, the recording was accepted while consent was still active.
+            with store.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                fresh = db.execute(
+                    'SELECT collection,withdrawn_at FROM consents WHERE id=? AND profile_id=?',
+                    (consent['id'], ident)).fetchone()
+                if not fresh or not fresh['collection'] or fresh['withdrawn_at']:
+                    raise HTTPException(409, 'Consent was withdrawn before this recording finalized.')
+                os.replace(temp_path, path)
+                finalized = True
+                db.execute(
+                    'INSERT INTO audio VALUES(?,?,?,?,?,?,?)',
+                    (audio_id, ident, consent['id'], hashlib.sha256(data).hexdigest(),
+                     json.dumps(stats), json.dumps(parsed), now()))
         except Exception:
-            path.unlink(missing_ok=True)
+            if finalized:
+                path.unlink(missing_ok=True)
             raise
+        finally:
+            temp_path.unlink(missing_ok=True)
         store.audit(user['id'], 'upload_audio', audio_id)
         return dict(id=audio_id, stats=stats)
 
