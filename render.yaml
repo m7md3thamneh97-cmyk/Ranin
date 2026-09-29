@@ -1,0 +1,35 @@
+# Owner-only staging. This creates paid compute and a persistent disk.
+# Reviewed baseline: $7/month compute + $0.25/month for 1 GB disk,
+# excluding taxes and usage beyond included allowances. No paid workspace upgrade.
+# Do not apply to an existing differently owned service with the same name.
+previews:
+  generation: "off"
+services:
+  - type: web
+    name: raneen-teaching-studio-staging
+    runtime: docker
+    repo: https://github.com/m7md3thamneh97-cmyk/Ranin
+    branch: deploy/render-staging
+    plan: starter
+    region: frankfurt
+    numInstances: 1
+    autoDeployTrigger: "off"
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    maxShutdownDelaySeconds: 60
+    disk:
+      name: raneen-studio-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: RANEEN_DATA_DIR
+        value: /var/data
+      - key: RANEEN_VOLUME_MOUNT_PATH
+        value: /var/data
+      - key: RANEEN_ADMIN_TOKEN
+        generateValue: true
+    # RENDER_EXTERNAL_URL is provided by Render and is used as the canonical origin.
+    # No credentials, recordings, Vapi keys or AI-provider keys belong in this file.
