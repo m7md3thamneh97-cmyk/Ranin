@@ -13,6 +13,7 @@ credential exists, and the enrollment carries the disclosed scope.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from .app import now, token_hash, uid
@@ -123,6 +124,13 @@ CREATE TABLE IF NOT EXISTS enrollment_operations(
  updated TEXT NOT NULL,
  UNIQUE(session_id, kind, op_key)
 );
+CREATE TABLE IF NOT EXISTS enrollment_realtime_calls(
+ session_id TEXT PRIMARY KEY REFERENCES enrollment_sessions(id) ON DELETE CASCADE,
+ call_id TEXT NOT NULL,
+ state TEXT NOT NULL,
+ started TEXT NOT NULL,
+ updated TEXT NOT NULL
+);
 """
 
 class Strict(BaseModel):
@@ -214,6 +222,46 @@ class Providers:
         if not isinstance(data.get("value"), str) or not data["value"].startswith("ek_"):
             raise ProviderError("OpenAI Realtime did not return a usable client secret.")
         return {"value": data["value"], "expires_at": data.get("expires_at")}
+
+
+    async def openai_create_call(self, api_key: str, safety_id: str, sdp: str, session: dict) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(40, connect=10), follow_redirects=False) as client:
+                r = await client.post(
+                    OPENAI_BASE + "/realtime/calls",
+                    headers={
+                        "Authorization": "Bearer " + api_key,
+                        "OpenAI-Safety-Identifier": safety_id,
+                    },
+                    files={
+                        "sdp": (None, sdp),
+                        "session": (None, _json(session)),
+                    },
+                )
+        except httpx.HTTPError as exc:
+            raise ProviderError("OpenAI Realtime WebRTC creation failed.", uncertain=False) from exc
+        if r.status_code >= 300:
+            raise ProviderError(f"OpenAI Realtime returned HTTP {r.status_code}.", uncertain=False)
+        location = r.headers.get("location", "")
+        call_id = location.rstrip("/").split("/")[-1]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,160}", call_id):
+            raise ProviderError("OpenAI Realtime did not return a usable call ID.")
+        answer = r.text
+        if not answer.startswith("v=") or len(answer) > 200_000:
+            raise ProviderError("OpenAI Realtime returned an invalid SDP answer.")
+        return {"call_id": call_id, "sdp": answer}
+
+    async def openai_hangup(self, api_key: str, call_id: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10), follow_redirects=False) as client:
+                r = await client.post(
+                    OPENAI_BASE + "/realtime/calls/" + quote(call_id, safe="") + "/hangup",
+                    headers={"Authorization": "Bearer " + api_key},
+                )
+        except httpx.HTTPError as exc:
+            raise ProviderError("OpenAI Realtime hangup failed.", uncertain=True) from exc
+        if r.status_code >= 300:
+            raise ProviderError(f"OpenAI Realtime hangup returned HTTP {r.status_code}.", uncertain=True)
 
     async def eleven_clone(self, api_key: str, name: str, files: list[tuple[str, Path, str]]) -> dict:
         opened = []
@@ -614,76 +662,34 @@ def install(app):
             "instruction": "Use the contributor's correction, then propose a new precise interpretation and confirm it again.",
         }
 
-    @app.post("/api/enrollment/sessions/{ident}/realtime-secret")
-    async def realtime_secret(ident: str, user=Depends(admin)):
-        gate()
-        row = own_session(ident, user)
-        consent(row, "external_processing")
-        api_key = _require_key("OPENAI_API_KEY")
-        instructions = f"""
+    def realtime_session_config(ident: str) -> dict:
+        return {
+            "type": "realtime",
+            "model": os.environ.get("RANEEN_REALTIME_MODEL", "gpt-realtime-2.1"),
+            "output_modalities": ["audio"],
+            "instructions": f"""
 You are the Raneen voice-enrollment interviewer. The speaker is teaching an AI how
 they naturally speak and handle customer situations. Converse naturally in the
 speaker's own language/dialect; do not force Emirati Arabic or formal Arabic.
 Your target session is 20-30 minutes, but adapt to the person.
 
-Alternate between: natural conversation, realistic customer role-play, asking what
+Alternate between natural conversation, realistic customer role-play, asking what
 mattered in a response, and changing one important fact to learn when their answer
 changes. Keep your turns short. Never dictate an ideal answer before collecting the
 speaker's answer. Preserve corrections, numbers, negation, names, and code-switching.
 
-When you have learned a reusable response pattern, call propose_evidence. After the
-tool returns an evidence_id, ask ONE specific spoken confirmation such as "So when X
-happens, you first do Y -- is that right?" On the speaker's next answer call
-confirm_evidence with that evidence_id. If they reject it, summarize their correction,
-propose a replacement, and confirm again. Do not claim that model weights are being
-trained. Do not claim to be the contributor. This is an internal AI enrollment session.
-
-Session id: {ident}
-"""
-        tools = [
-            {
-                "type": "function",
-                "name": "propose_evidence",
-                "description": "Propose one reusable response/decision/style pattern learned from the contributor. The app will require spoken confirmation.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["response_pattern", "decision_rule", "style_preference"]},
-                        "situation": {"type": "string"},
-                        "interpretation": {"type": "string"},
-                        "change_condition": {"type": "string"},
-                    },
-                    "required": ["kind", "situation", "interpretation", "change_condition"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "confirm_evidence",
-                "description": "Record the contributor's spoken acceptance or rejection of a previously proposed evidence item.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "evidence_id": {"type": "string"},
-                        "accepted": {"type": "boolean"},
-                        "correction": {"type": "string"},
-                    },
-                    "required": ["evidence_id", "accepted", "correction"],
-                    "additionalProperties": False,
-                },
-            },
-        ]
-        session = {
-            "type": "realtime",
-            "model": os.environ.get("RANEEN_REALTIME_MODEL", "gpt-realtime-2.1"),
-            "output_modalities": ["audio"],
-            "instructions": instructions,
+When you learn a reusable response pattern, call propose_evidence. After the tool
+returns an evidence_id, ask one specific spoken confirmation. On the speaker's next
+answer call confirm_evidence with that evidence_id. If they reject it, summarize the
+correction, propose a replacement, and confirm again. Do not claim model-weight
+training and do not claim to be the contributor. Session id: {ident}
+""",
             "audio": {
                 "output": {"voice": os.environ.get("RANEEN_INTERVIEWER_VOICE", "marin")},
                 "input": {
                     "transcription": {
                         "model": os.environ.get("RANEEN_LIVE_TRANSCRIBE_MODEL", "gpt-live-transcribe"),
-                        "prompt": "Transcribe the speaker verbatim. Preserve colloquial Arabic, English words, numbers, negation, and names. Do not formalize.",
+                        "prompt": "Transcribe verbatim. Preserve colloquial Arabic, English words, numbers, negation, and names. Do not formalize.",
                     },
                     "turn_detection": {
                         "type": "semantic_vad",
@@ -693,15 +699,141 @@ Session id: {ident}
                     },
                 },
             },
-            "tools": tools,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "propose_evidence",
+                    "description": "Propose one reusable response, decision, or style pattern learned from the contributor. Spoken confirmation is required.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["response_pattern", "decision_rule", "style_preference"]},
+                            "situation": {"type": "string"},
+                            "interpretation": {"type": "string"},
+                            "change_condition": {"type": "string"},
+                        },
+                        "required": ["kind", "situation", "interpretation", "change_condition"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "type": "function",
+                    "name": "confirm_evidence",
+                    "description": "Record the contributor's spoken acceptance or rejection of a proposed evidence item.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "evidence_id": {"type": "string"},
+                            "accepted": {"type": "boolean"},
+                            "correction": {"type": "string"},
+                        },
+                        "required": ["evidence_id", "accepted", "correction"],
+                        "additionalProperties": False,
+                    },
+                },
+            ],
             "tool_choice": "auto",
         }
+
+    async def close_realtime_later(session_id: str, call_id: str, delay: int):
+        await asyncio.sleep(max(0, delay))
+        live = store.one(
+            "SELECT state,call_id FROM enrollment_realtime_calls WHERE session_id=?",
+            (session_id,),
+        )
+        if not live or live["state"] != "open" or live["call_id"] != call_id:
+            return
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not key:
+            store.execute(
+                "UPDATE enrollment_realtime_calls SET state='close_unknown',updated=? WHERE session_id=?",
+                (now(), session_id),
+            )
+            return
+        try:
+            await app.state.enrollment_provider.openai_hangup(key, call_id)
+        except ProviderError:
+            store.execute(
+                "UPDATE enrollment_realtime_calls SET state='close_unknown',updated=? WHERE session_id=?",
+                (now(), session_id),
+            )
+            return
+        store.execute(
+            "UPDATE enrollment_realtime_calls SET state='closed',updated=? WHERE session_id=?",
+            (now(), session_id),
+        )
+
+    @app.on_event("startup")
+    async def recover_realtime_calls():
+        # A server restart invalidates our local control lease. Fail closed by ending
+        # any call the previous process still considered open.
+        for live in store.all("SELECT session_id,call_id FROM enrollment_realtime_calls WHERE state='open'"):
+            asyncio.create_task(close_realtime_later(live["session_id"], live["call_id"], 0))
+
+    @app.post("/api/enrollment/sessions/{ident}/webrtc")
+    async def create_webrtc(ident: str, request: Request, user=Depends(admin)):
+        gate()
+        row = own_session(ident, user)
+        consent(row, "external_processing")
+        if request.headers.get("content-type", "").split(";")[0] not in {"application/sdp", "text/plain"}:
+            raise HTTPException(415, "Expected an SDP offer.")
+        raw = await request.body()
+        if not raw or len(raw) > 200_000:
+            raise HTTPException(422, "Invalid SDP offer.")
+        try:
+            offer = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(422, "SDP offer must be UTF-8.") from None
+        current = store.one(
+            "SELECT call_id,state FROM enrollment_realtime_calls WHERE session_id=?",
+            (ident,),
+        )
+        if current and current["state"] == "open":
+            raise HTTPException(409, "An interview call is already active for this enrollment.")
+        api_key = _require_key("OPENAI_API_KEY")
         safety_id = hashlib.sha256(("raneen:" + user["id"]).encode()).hexdigest()[:64]
         try:
-            result = await app.state.enrollment_provider.openai_realtime_secret(api_key, safety_id, session)
+            result = await app.state.enrollment_provider.openai_create_call(
+                api_key, safety_id, offer, realtime_session_config(ident)
+            )
         except ProviderError as exc:
             raise HTTPException(502, str(exc)) from None
-        return result
+        stamp = now()
+        store.execute(
+            "INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?) "
+            "ON CONFLICT(session_id) DO UPDATE SET call_id=excluded.call_id,state='open',started=excluded.started,updated=excluded.updated",
+            (ident, result["call_id"], "open", stamp, stamp),
+        )
+        try:
+            maximum = max(60, min(3600, int(os.environ.get("RANEEN_INTERVIEW_MAX_SECONDS", "2100"))))
+        except ValueError:
+            maximum = 2100
+        asyncio.create_task(close_realtime_later(ident, result["call_id"], maximum))
+        return Response(result["sdp"], media_type="application/sdp", headers={"X-Raneen-Interview-Limit": str(maximum)})
+
+    @app.post("/api/enrollment/sessions/{ident}/webrtc-close")
+    async def close_webrtc(ident: str, user=Depends(admin)):
+        gate()
+        own_session(ident, user, require_active=False)
+        live = store.one(
+            "SELECT call_id,state FROM enrollment_realtime_calls WHERE session_id=?",
+            (ident,),
+        )
+        if not live or live["state"] != "open":
+            return {"state": live["state"] if live else "none"}
+        try:
+            await app.state.enrollment_provider.openai_hangup(_require_key("OPENAI_API_KEY"), live["call_id"])
+        except ProviderError as exc:
+            store.execute(
+                "UPDATE enrollment_realtime_calls SET state='close_unknown',updated=? WHERE session_id=?",
+                (now(), ident),
+            )
+            raise HTTPException(502, str(exc)) from None
+        store.execute(
+            "UPDATE enrollment_realtime_calls SET state='closed',updated=? WHERE session_id=?",
+            (now(), ident),
+        )
+        return {"state": "closed"}
 
     @app.post("/api/enrollment/sessions/{ident}/behavior", status_code=201)
     def build_behavior(ident: str, body: ExternalApproval, user=Depends(admin)):
