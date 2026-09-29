@@ -112,6 +112,20 @@ CREATE TABLE IF NOT EXISTS enrollment_behavior_versions(
  created TEXT NOT NULL,
  UNIQUE(session_id, version)
 );
+CREATE TABLE IF NOT EXISTS enrollment_voice_versions(
+ id TEXT PRIMARY KEY,
+ session_id TEXT NOT NULL REFERENCES enrollment_sessions(id) ON DELETE CASCADE,
+ version INTEGER NOT NULL,
+ provider TEXT NOT NULL,
+ provider_voice_id TEXT,
+ state TEXT NOT NULL,
+ sample_manifest TEXT NOT NULL,
+ manifest_digest TEXT NOT NULL,
+ created TEXT NOT NULL,
+ updated TEXT NOT NULL,
+ UNIQUE(session_id, version),
+ UNIQUE(session_id, manifest_digest)
+);
 CREATE TABLE IF NOT EXISTS enrollment_operations(
  id TEXT PRIMARY KEY,
  session_id TEXT NOT NULL REFERENCES enrollment_sessions(id) ON DELETE CASCADE,
@@ -886,6 +900,58 @@ training and do not claim to be the contributor. Session id: {ident}
         )
         return {"id": behavior_id, "version": current + 1, "reused": False}
 
+    def select_clone_chunks(session_id: str) -> tuple[list[dict], dict]:
+        chunks = store.all(
+            "SELECT seq,sha256,byte_count,duration_ms,mime,path FROM enrollment_chunks "
+            "WHERE session_id=? AND role='contributor' ORDER BY seq",
+            (session_id,),
+        )
+        usable = []
+        for chunk in chunks:
+            path = Path(chunk["path"])
+            if not path.is_file() or path.is_symlink():
+                continue
+            usable.append(chunk)
+        if not usable:
+            return [], {"chunks": [], "total_ms": 0}
+        # IVC generally benefits from a short, consistent sample rather than a full
+        # 20–30 minute session. When we have plenty of audio, sample deterministically
+        # across the interview instead of using only the opening minute.
+        desired = max(1, MAX_CLONE_MS // 3000)
+        stride = max(1, len(usable) // desired)
+        candidates = usable[::stride]
+        chosen = []
+        total = 0
+        for chunk in candidates:
+            if total >= MAX_CLONE_MS:
+                break
+            if total and total + chunk["duration_ms"] > MAX_CLONE_MS:
+                continue
+            chosen.append(chunk)
+            total += chunk["duration_ms"]
+        manifest = {
+            "provider": "elevenlabs",
+            "selection": "deterministic_spread_v1",
+            "chunks": [
+                {
+                    "seq": x["seq"],
+                    "sha256": x["sha256"],
+                    "byte_count": x["byte_count"],
+                    "duration_ms": x["duration_ms"],
+                    "mime": x["mime"],
+                }
+                for x in chosen
+            ],
+            "total_ms": total,
+        }
+        return chosen, manifest
+
+    def latest_voice_version(session_id: str):
+        return store.one(
+            "SELECT * FROM enrollment_voice_versions WHERE session_id=? ORDER BY version DESC LIMIT 1",
+            (session_id,),
+        )
+
     @app.post("/api/enrollment/sessions/{ident}/clone")
     async def create_clone(ident: str, body: ExternalApproval, user=Depends(admin)):
         gate()
@@ -894,32 +960,70 @@ training and do not claim to be the contributor. Session id: {ident}
         row = own_session(ident, user)
         consent(row, "voice_cloning")
         consent(row, "external_processing")
+        current_voice = latest_voice_version(ident)
         if row["voice_state"] == "ready" and row["voice_id"]:
-            return {"state": "ready", "voice_id": row["voice_id"], "reused": True}
+            return {
+                "state": "ready",
+                "voice_id": row["voice_id"],
+                "voice_version_id": current_voice["id"] if current_voice else None,
+                "reused": True,
+            }
         if row["voice_state"] in {"verification_required", "outcome_unknown"}:
-            return {"state": row["voice_state"], "voice_id": row["voice_id"], "reused": True}
-        chunks = store.all(
-            "SELECT seq,duration_ms,mime,path FROM enrollment_chunks WHERE session_id=? AND role='contributor' ORDER BY seq",
-            (ident,),
-        )
-        chosen = []
-        total = 0
-        for chunk in chunks:
-            if total >= MAX_CLONE_MS:
-                break
-            path = Path(chunk["path"])
-            if not path.is_file() or path.is_symlink():
-                continue
-            chosen.append(chunk)
-            total += chunk["duration_ms"]
+            return {
+                "state": row["voice_state"],
+                "voice_id": row["voice_id"],
+                "voice_version_id": current_voice["id"] if current_voice else None,
+                "reused": True,
+            }
+        chosen, manifest = select_clone_chunks(ident)
         minimum = int(os.environ.get("RANEEN_CLONE_MIN_MS", str(MIN_CLONE_MS)))
-        if total < minimum:
-            raise HTTPException(409, f"Need more clean contributor speech before cloning ({total//1000}s captured).")
-        operation, fresh = op_start(ident, "voice_clone", "ivc-v1")
+        if manifest["total_ms"] < minimum:
+            raise HTTPException(
+                409,
+                f"Need more contributor microphone speech before cloning ({manifest['total_ms']//1000}s selected).",
+            )
+        manifest_serial = _json(manifest)
+        manifest_digest = hashlib.sha256(manifest_serial.encode()).hexdigest()
+        operation, fresh = op_start(ident, "voice_clone", "ivc-v1:" + manifest_digest)
         if not fresh:
+            version = store.one(
+                "SELECT id,state,provider_voice_id FROM enrollment_voice_versions "
+                "WHERE session_id=? AND manifest_digest=?",
+                (ident, manifest_digest),
+            )
             if operation["state"] == "succeeded":
-                return {"state": "ready", "voice_id": operation["provider_id"], "reused": True}
-            raise HTTPException(409, f"Voice clone operation is {operation['state']}; reconcile it before retrying.")
+                return {
+                    "state": version["state"] if version else "ready",
+                    "voice_id": operation["provider_id"],
+                    "voice_version_id": version["id"] if version else None,
+                    "reused": True,
+                }
+            raise HTTPException(
+                409,
+                f"Voice clone operation for this exact sample set is {operation['state']}; "
+                "do not retry it blindly. Capture different approved audio or reconcile the provider outcome.",
+            )
+
+        next_version = store.one(
+            "SELECT COALESCE(MAX(version),0)+1 AS v FROM enrollment_voice_versions WHERE session_id=?",
+            (ident,),
+        )["v"]
+        voice_version_id = uid()
+        stamp = now()
+        store.execute(
+            "INSERT INTO enrollment_voice_versions VALUES(?,?,?,?,NULL,?,?,?,?,?)",
+            (
+                voice_version_id,
+                ident,
+                next_version,
+                "elevenlabs",
+                "creating",
+                manifest_serial,
+                manifest_digest,
+                stamp,
+                stamp,
+            ),
+        )
         api_key = _require_key("ELEVENLABS_API_KEY")
         files = []
         for chunk in chosen:
@@ -928,23 +1032,50 @@ training and do not claim to be the contributor. Session id: {ident}
             files.append((f"sample-{chunk['seq']:04d}{suffix}", path, chunk["mime"]))
         try:
             result = await app.state.enrollment_provider.eleven_clone(
-                api_key, "Raneen private enrollment " + ident[:8], files
+                api_key, "Raneen private enrollment " + ident[:8] + " voice-v" + str(next_version), files
             )
         except ProviderError as exc:
             state = "outcome_unknown" if exc.uncertain else "failed"
-            op_update(operation["id"], state, detail={"error": str(exc)})
+            op_update(
+                operation["id"],
+                state,
+                detail={"error": str(exc), "voice_version_id": voice_version_id, "manifest_digest": manifest_digest},
+            )
+            store.execute(
+                "UPDATE enrollment_voice_versions SET state=?,updated=? WHERE id=?",
+                (state, now(), voice_version_id),
+            )
             store.execute(
                 "UPDATE enrollment_sessions SET voice_state=?,updated=? WHERE id=?",
                 (state, now(), ident),
             )
             raise HTTPException(502 if exc.uncertain else 422, str(exc)) from None
         state = "verification_required" if result["requires_verification"] else "ready"
-        op_update(operation["id"], "succeeded", provider_id=result["voice_id"], detail={"requires_verification": result["requires_verification"]})
+        op_update(
+            operation["id"],
+            "succeeded",
+            provider_id=result["voice_id"],
+            detail={
+                "requires_verification": result["requires_verification"],
+                "voice_version_id": voice_version_id,
+                "manifest_digest": manifest_digest,
+            },
+        )
+        stamp = now()
+        store.execute(
+            "UPDATE enrollment_voice_versions SET provider_voice_id=?,state=?,updated=? WHERE id=?",
+            (result["voice_id"], state, stamp, voice_version_id),
+        )
         store.execute(
             "UPDATE enrollment_sessions SET voice_id=?,voice_state=?,updated=? WHERE id=?",
-            (result["voice_id"], state, now(), ident),
+            (result["voice_id"], state, stamp, ident),
         )
-        return {"state": state, "voice_id": result["voice_id"], "reused": False}
+        return {
+            "state": state,
+            "voice_id": result["voice_id"],
+            "voice_version_id": voice_version_id,
+            "reused": False,
+        }
 
     @app.post("/api/enrollment/sessions/{ident}/preview")
     async def synth_preview(ident: str, body: PreviewRequest, user=Depends(admin)):
