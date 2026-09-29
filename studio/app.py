@@ -261,7 +261,7 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
                 "img-src data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
         elif request.url.path == '/enroll':
             response.headers['Content-Security-Policy'] = ("default-src 'self'; script-src 'self'; style-src 'self'; "
-                "img-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://api.openai.com; "
+                "img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; "
                 "frame-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; "
                 "base-uri 'self'; form-action 'self'")
         else:
