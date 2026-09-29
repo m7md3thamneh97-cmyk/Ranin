@@ -2,7 +2,7 @@
 
 Refuse to start without a canonical HTTPS origin, a dedicated mounted data
 filesystem, and an explicitly supplied strong owner credential. No cloud API
-credentials are needed by this process.
+credentials are needed to start. Optional AI calls require separately configured keys.
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 import uvicorn
-from studio.app import create_app, token_hash, now
+from studio.app import token_hash, now
+from studio.runtime import create_app
 
 OWNER_ID = 'deployment-owner'
 
