@@ -254,7 +254,18 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Cache-Control'] = 'no-store'
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        if request.url.path == '/vapi-frame':
+            response.headers['Content-Security-Policy'] = ("default-src 'none'; script-src 'self' https://unpkg.com; "
+                "style-src 'self' 'unsafe-inline'; connect-src https://api.vapi.ai https://*.vapi.ai wss://*.vapi.ai "
+                "https://*.daily.co wss://*.daily.co; media-src blob: https://*.daily.co; "
+                "img-src data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
+        elif request.url.path == '/enroll':
+            response.headers['Content-Security-Policy'] = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://api.openai.com; "
+                "frame-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; "
+                "base-uri 'self'; form-action 'self'")
+        else:
+            response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         response.headers['Permissions-Policy'] = 'microphone=(self), camera=(), geolocation=()'
         return response
 
