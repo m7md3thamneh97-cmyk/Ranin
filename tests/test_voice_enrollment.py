@@ -30,6 +30,8 @@ class FakeProviders:
         self.vapi_calls = []
         self.secret_calls = 0
         self.hangup_calls = 0
+        self.deleted_voices = []
+        self.deleted_assistants = []
         self.clone_error = None
         self.requires_verification = False
 
@@ -61,11 +63,19 @@ class FakeProviders:
             raise self.clone_error
         return {"voice_id": "voice_test_123456", "requires_verification": self.requires_verification}
 
+    async def eleven_delete_voice(self, api_key, voice_id):
+        assert api_key == "test-eleven"
+        self.deleted_voices.append(voice_id)
+
     async def eleven_speech(self, api_key, voice_id, text):
         assert api_key == "test-eleven"
         assert voice_id == "voice_test_123456"
         self.speech_calls.append(text)
         return b"ID3" + b"x" * 1500
+
+    async def vapi_delete_assistant(self, api_key, assistant_id):
+        assert api_key == "test-vapi-private"
+        self.deleted_assistants.append(assistant_id)
 
     async def vapi_json(self, api_key, method, path, *, json_body=None):
         assert api_key == "test-vapi-private"
@@ -304,3 +314,43 @@ def test_revocation_blocks_local_use(env, monkeypatch):
     r = c.post("/api/enrollment/sessions/%s/revoke" % sid, headers=auth(owner), json={"confirm": True})
     assert r.status_code == 200 and r.json()["local_use_blocked"] is True
     assert upload(c, owner, sid, 1).status_code == 410
+
+
+def test_revocation_deletes_known_provider_artifacts_and_is_idempotent(env, monkeypatch):
+    c, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(c, owner)
+    for seq in range(4):
+        upload(c, owner, sid, seq)
+    confirm_pattern(c, owner, sid)
+    behavior = c.post(
+        "/api/enrollment/sessions/%s/behavior" % sid,
+        headers=auth(owner),
+        json={"approve": True},
+    ).json()
+    clone = c.post(
+        "/api/enrollment/sessions/%s/clone" % sid,
+        headers=auth(owner),
+        json={"approve": True},
+    )
+    assert clone.status_code == 200
+    assistant = c.post(
+        "/api/enrollment/sessions/%s/assistant" % sid,
+        headers=auth(owner),
+        json={"approve": True, "behavior_id": behavior["id"]},
+    )
+    assert assistant.status_code == 200
+    revoked = c.post(
+        "/api/enrollment/sessions/%s/revoke" % sid,
+        headers=auth(owner),
+        json={"confirm": True},
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["provider_cleanup"] == "complete"
+    assert fake.deleted_voices == ["voice_test_123456"]
+    assert fake.deleted_assistants == ["11111111-2222-3333-4444-555555555555"]
+    # Delete is idempotent: the cleanup endpoint observes succeeded operations and
+    # does not issue the provider DELETE again.
+    retry = c.post("/api/enrollment/sessions/%s/cleanup" % sid, headers=auth(owner), json={})
+    assert retry.status_code == 200 and retry.json()["provider_cleanup"] == "complete"
+    assert len(fake.deleted_voices) == 1 and len(fake.deleted_assistants) == 1
