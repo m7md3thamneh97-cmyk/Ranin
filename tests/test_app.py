@@ -262,3 +262,26 @@ def test_signal_checks_not_language_scores():
     assert 'very_short' in analyze_wav(wav(seconds=.2))['flags']
     with pytest.raises(ValueError):analyze_wav(wav(channels=2))
     with pytest.raises(ValueError):analyze_wav(wav()[:-5])
+
+
+def test_withdraw_during_audio_processing_blocks_finalize(env, monkeypatch):
+    c,s,a,u,o=env
+    pid=profile(c,u)
+    original=analyze_wav
+
+    def withdraw_after_initial_check(data):
+        s.execute(
+            "UPDATE consents SET withdrawn_at=? WHERE profile_id=? AND withdrawn_at IS NULL",
+            ("2026-09-29T22:30:00+00:00", pid),
+        )
+        return original(data)
+
+    monkeypatch.setattr("studio.app.analyze_wav", withdraw_after_initial_check)
+    r=c.post(
+        f"/api/profiles/{pid}/audio",
+        headers={**auth(u),"Content-Type":"audio/wav"},
+        content=wav(),
+    )
+    assert r.status_code==409,r.text
+    assert s.one("SELECT id FROM audio WHERE profile_id=?",(pid,)) is None
+    assert list(s.audio_dir.glob("*.wav"))==[]
