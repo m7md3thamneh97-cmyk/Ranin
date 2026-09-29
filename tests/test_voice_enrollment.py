@@ -29,6 +29,7 @@ class FakeProviders:
         self.speech_calls = []
         self.vapi_calls = []
         self.secret_calls = 0
+        self.hangup_calls = 0
         self.clone_error = None
         self.requires_verification = False
 
@@ -38,6 +39,19 @@ class FakeProviders:
         assert safety_id and session["type"] == "realtime"
         assert any(x["name"] == "propose_evidence" for x in session["tools"])
         return {"value": "ek_test_ephemeral", "expires_at": 9999999999}
+
+    async def openai_create_call(self, api_key, safety_id, sdp, session):
+        self.secret_calls += 1
+        assert api_key == "test-openai"
+        assert safety_id and sdp.startswith("v=")
+        assert session["type"] == "realtime"
+        assert any(x["name"] == "propose_evidence" for x in session["tools"])
+        return {"call_id": "rtc_test_123456", "sdp": "v=0\r\ns=mock\r\n"}
+
+    async def openai_hangup(self, api_key, call_id):
+        assert api_key == "test-openai"
+        assert call_id == "rtc_test_123456"
+        self.hangup_calls += 1
 
     async def eleven_clone(self, api_key, name, files):
         self.clone_calls += 1
@@ -192,9 +206,16 @@ def test_realtime_evidence_and_behavior_versions(env, monkeypatch):
     c, app, owner, _, fake = env
     enable(monkeypatch)
     sid = start(c, owner)
-    secret = c.post("/api/enrollment/sessions/%s/realtime-secret" % sid, headers=auth(owner), json={})
-    assert secret.status_code == 200 and secret.json()["value"].startswith("ek_")
+    rtc = c.post(
+        "/api/enrollment/sessions/%s/webrtc" % sid,
+        headers=auth(owner) | {"Content-Type": "application/sdp"},
+        content=b"v=0\r\ns=test\r\n",
+    )
+    assert rtc.status_code == 200 and rtc.text.startswith("v=0")
     assert fake.secret_calls == 1
+    closed = c.post("/api/enrollment/sessions/%s/webrtc-close" % sid, headers=auth(owner), json={})
+    assert closed.status_code == 200 and closed.json()["state"] == "closed"
+    assert fake.hangup_calls == 1
     confirm_pattern(c, owner, sid, "1")
     v1 = c.post("/api/enrollment/sessions/%s/behavior" % sid, headers=auth(owner), json={"approve": True})
     assert v1.status_code == 201
