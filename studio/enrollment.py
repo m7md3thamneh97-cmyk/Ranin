@@ -316,6 +316,20 @@ class Providers:
             raise ProviderError("ElevenLabs clone result did not contain a valid voice ID.", uncertain=True)
         return {"voice_id": voice_id, "requires_verification": bool(data.get("requires_verification"))}
 
+    async def eleven_delete_voice(self, api_key: str, voice_id: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10), follow_redirects=False) as client:
+                r = await client.delete(
+                    ELEVEN_BASE + "/voices/" + quote(voice_id, safe=""),
+                    headers={"xi-api-key": api_key},
+                )
+        except httpx.HTTPError as exc:
+            raise ProviderError("ElevenLabs voice deletion could not be confirmed.", uncertain=True) from exc
+        if r.status_code == 404:
+            return
+        if r.status_code >= 300:
+            raise ProviderError(f"ElevenLabs voice deletion returned HTTP {r.status_code}.", uncertain=True)
+
     async def eleven_speech(self, api_key: str, voice_id: str, text: str) -> bytes:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
@@ -357,6 +371,20 @@ class Providers:
             return r.json()
         except ValueError as exc:
             raise ProviderError("Vapi returned invalid JSON.", uncertain=method != "GET") from exc
+
+    async def vapi_delete_assistant(self, api_key: str, assistant_id: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10), follow_redirects=False) as client:
+                r = await client.delete(
+                    VAPI_BASE + "/assistant/" + quote(assistant_id, safe=""),
+                    headers={"Authorization": "Bearer " + api_key},
+                )
+        except httpx.HTTPError as exc:
+            raise ProviderError("Vapi assistant deletion could not be confirmed.", uncertain=True) from exc
+        if r.status_code == 404:
+            return
+        if r.status_code >= 300:
+            raise ProviderError(f"Vapi assistant deletion returned HTTP {r.status_code}.", uncertain=True)
 
 
 def install(app):
@@ -427,6 +455,64 @@ def install(app):
             "UPDATE enrollment_operations SET state=?,provider_id=COALESCE(?,provider_id),detail=?,updated=? WHERE id=?",
             (state, provider_id, _json(detail or {}), now(), ident),
         )
+
+    def cleanup_summary(session_id: str) -> str:
+        unknown = store.one(
+            "SELECT COUNT(*) AS n FROM enrollment_operations "
+            "WHERE session_id=? AND state='outcome_unknown' AND kind IN ('voice_clone','vapi_assistant')",
+            (session_id,),
+        )["n"]
+        rows = store.all(
+            "SELECT state FROM enrollment_operations WHERE session_id=? AND kind IN ('cleanup_voice','cleanup_assistant')",
+            (session_id,),
+        )
+        if unknown:
+            return "manual_reconciliation"
+        if not rows:
+            return "none"
+        return "complete" if all(x["state"] == "succeeded" for x in rows) else "pending"
+
+    async def cleanup_provider_artifacts(session_id: str) -> str:
+        row = store.one("SELECT voice_id,assistant_id,revoked_at FROM enrollment_sessions WHERE id=?", (session_id,))
+        if not row or not row["revoked_at"]:
+            return "not_revoked"
+        specs = [
+            ("cleanup_assistant", row["assistant_id"], "VAPI_API_KEY", "vapi"),
+            ("cleanup_voice", row["voice_id"], "ELEVENLABS_API_KEY", "elevenlabs"),
+        ]
+        for kind, provider_id, key_name, provider in specs:
+            if not provider_id:
+                continue
+            operation, _ = op_start(session_id, kind, provider_id)
+            if operation["state"] == "succeeded":
+                continue
+            key = os.environ.get(key_name, "").strip()
+            if not key:
+                op_update(
+                    operation["id"],
+                    "pending_credentials",
+                    provider_id=provider_id,
+                    detail={"provider": provider, "reason": "credential unavailable"},
+                )
+                continue
+            op_update(operation["id"], "dispatching", provider_id=provider_id, detail={"provider": provider})
+            try:
+                if provider == "vapi":
+                    await app.state.enrollment_provider.vapi_delete_assistant(key, provider_id)
+                else:
+                    await app.state.enrollment_provider.eleven_delete_voice(key, provider_id)
+            except ProviderError as exc:
+                # Provider deletion is idempotent; a later retry is safe. Never call it
+                # complete unless the provider confirmed deletion or returned not-found.
+                op_update(
+                    operation["id"],
+                    "retryable",
+                    provider_id=provider_id,
+                    detail={"provider": provider, "error": str(exc)},
+                )
+                continue
+            op_update(operation["id"], "succeeded", provider_id=provider_id, detail={"provider": provider})
+        return cleanup_summary(session_id)
 
     @app.get("/api/enrollment/status")
     def status(user=Depends(actor)):
@@ -783,6 +869,11 @@ training and do not claim to be the contributor. Session id: {ident}
         # any call the previous process still considered open.
         for live in store.all("SELECT session_id,call_id FROM enrollment_realtime_calls WHERE state='open'"):
             asyncio.create_task(close_realtime_later(live["session_id"], live["call_id"], 0))
+
+    @app.on_event("startup")
+    async def recover_revoked_cleanup():
+        for revoked in store.all("SELECT id FROM enrollment_sessions WHERE revoked_at IS NOT NULL"):
+            asyncio.create_task(cleanup_provider_artifacts(revoked["id"]))
 
     @app.post("/api/enrollment/sessions/{ident}/webrtc")
     async def create_webrtc(ident: str, request: Request, user=Depends(admin)):
@@ -1211,23 +1302,36 @@ training and do not claim to be the contributor. Session id: {ident}
         }
 
     @app.post("/api/enrollment/sessions/{ident}/revoke")
-    def revoke(ident: str, body: RevokeRequest, user=Depends(admin)):
+    async def revoke(ident: str, body: RevokeRequest, user=Depends(admin)):
         gate()
         if not body.confirm:
             raise HTTPException(403, "Confirm revocation.")
         own_session(ident, user, require_active=False)
         stamp = now()
         store.execute(
-            "UPDATE enrollment_sessions SET state='revoked',revoked_at=?,updated=? WHERE id=? AND revoked_at IS NULL",
+            "UPDATE enrollment_sessions SET state='revoked',revoked_at=COALESCE(revoked_at,?),updated=? WHERE id=?",
             (stamp, stamp, ident),
         )
-        store.audit(user["id"], "enrollment_revoked", ident, {"provider_cleanup": "pending"})
+        store.audit(user["id"], "enrollment_revoked", ident, {"provider_cleanup": "started"})
+        cleanup = await cleanup_provider_artifacts(ident)
         return {
             "state": "revoked",
             "local_use_blocked": True,
-            "provider_cleanup": "pending",
-            "note": "External artifacts require tracked provider deletion; universal deletion is not claimed.",
+            "provider_cleanup": cleanup,
+            "note": (
+                "Known external artifacts are deleted with tracked idempotent operations. "
+                "Unknown create outcomes require operator reconciliation; universal deletion "
+                "of backups or prior exports is never claimed."
+            ),
         }
+
+    @app.post("/api/enrollment/sessions/{ident}/cleanup")
+    async def retry_cleanup(ident: str, user=Depends(admin)):
+        gate()
+        row = own_session(ident, user, require_active=False)
+        if not row["revoked_at"]:
+            raise HTTPException(409, "Cleanup is only available after revocation.")
+        return {"provider_cleanup": await cleanup_provider_artifacts(ident)}
 
     static = Path(__file__).parent / "static"
 
