@@ -1,0 +1,8 @@
+*
+!requirements.txt
+!studio/
+!studio/**
+!serve.py
+!docker-entrypoint.py
+**/__pycache__/
+**/*.pyc

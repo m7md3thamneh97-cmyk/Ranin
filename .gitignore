@@ -1,0 +1,10 @@
+data/
+*.sqlite3*
+*.wav
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
