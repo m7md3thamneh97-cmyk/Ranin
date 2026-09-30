@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - work/voice-enrollment-v1
+      - work/rve-guided-platform-v1
+      - deploy/render-staging
   workflow_dispatch:
 
 permissions:
@@ -28,7 +30,26 @@ jobs:
         run: python -m pytest -q
       - name: PCM WAV encoder assertions
         run: node tests/wav_encoder.mjs
+      - name: Enrollment capture and recovery assertions
+        run: node tests/enrollment_capture.mjs
       - name: Syntax-check enrollment browser modules
         run: |
           node --check studio/static/enroll.js
           node --check studio/static/vapi-frame.js
+          for module in studio/static/enrollment-*.js; do node --check "$module"; done
+      - name: Install synthetic browser test dependencies
+        run: |
+          python -m pip install -r requirements-browser.txt
+          python -m playwright install --with-deps chromium --only-shell
+      - name: Guided enrollment browser smoke
+        env:
+          RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-enrollment-ui
+        run: python tests/enrollment_dom.py
+      - name: Save synthetic interface screenshots
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: enrollment-interface-synthetic
+          path: ${{ runner.temp }}/raneen-enrollment-ui
+          if-no-files-found: ignore
+          retention-days: 7

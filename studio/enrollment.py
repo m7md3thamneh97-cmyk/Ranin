@@ -25,11 +25,12 @@ from typing import Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from .app import now, token_hash, uid
+from .enrollment_journey import journey_summary, recovery_summary
 
 FEATURE = "RANEEN_VOICE_ENROLLMENT_ENABLED"
 CONSENT_VERSION = "voice-enrollment-v1"
@@ -544,27 +545,68 @@ def install(app):
             and body.private_preview
         ):
             raise HTTPException(422, "All disclosed Gate A scopes are required for the cloned-agent test.")
-        active = store.one(
-            "SELECT id FROM enrollment_sessions WHERE owner_id=? AND revoked_at IS NULL AND state NOT IN ('complete','failed') ORDER BY created DESC LIMIT 1",
-            (user["id"],),
-        )
-        if active:
-            return {"id": active["id"], "resumed": True}
-        ident = uid()
         payload = body.model_dump() | {"text": CONSENT_TEXT}
         stamp = now()
-        store.execute(
-            "INSERT INTO enrollment_sessions(id,owner_id,state,consent_version,consent_json,created,updated) VALUES(?,?,?,?,?,?,?)",
-            (ident, user["id"], "collecting", CONSENT_VERSION, _json(payload), stamp, stamp),
-        )
+        # Serialize admission across threads/processes sharing this SQLite database.
+        # The previous check then insert could create two active enrollments after
+        # concurrent clicks. This needs no schema change or destructive migration.
+        with store.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            active = db.execute(
+                "SELECT id FROM enrollment_sessions WHERE owner_id=? AND revoked_at IS NULL "
+                "AND state NOT IN ('complete','failed') ORDER BY created DESC LIMIT 1",
+                (user["id"],),
+            ).fetchone()
+            ident = active["id"] if active else uid()
+            if not active:
+                db.execute(
+                    "INSERT INTO enrollment_sessions(id,owner_id,state,consent_version,consent_json,created,updated) VALUES(?,?,?,?,?,?,?)",
+                    (ident, user["id"], "collecting", CONSENT_VERSION, _json(payload), stamp, stamp),
+                )
         (root / ident / "chunks").mkdir(parents=True, exist_ok=True)
         (root / ident / "previews").mkdir(parents=True, exist_ok=True)
-        store.audit(user["id"], "enrollment_started", ident, {"version": CONSENT_VERSION})
-        return {"id": ident, "resumed": False}
+        if not active:
+            store.audit(user["id"], "enrollment_started", ident, {"version": CONSENT_VERSION})
+        return {"id": ident, "resumed": bool(active)}
+
+    summary_select = """
+        SELECT s.id,s.state,s.revoked_at,s.created,s.updated,s.voice_state,s.active_behavior_id,
+          (SELECT COALESCE(SUM(duration_ms),0) FROM enrollment_chunks WHERE session_id=s.id AND role='contributor') AS saved_audio_ms,
+          (SELECT COUNT(*) FROM enrollment_chunks WHERE session_id=s.id) AS chunk_count,
+          (SELECT COALESCE(MAX(seq)+1,0) FROM enrollment_chunks WHERE session_id=s.id) AS next_seq,
+          (SELECT COUNT(*) FROM enrollment_evidence WHERE session_id=s.id AND status='confirmed') AS confirmed_patterns,
+          (SELECT COUNT(*) FROM enrollment_evidence WHERE session_id=s.id AND status='pending') AS pending_patterns
+        FROM enrollment_sessions s
+    """
+
+    @app.get("/api/enrollment/sessions")
+    def list_sessions(limit: int = Query(default=20, ge=1, le=50), user=Depends(admin)):
+        # Recovery and consent withdrawal stay available if new enrollment is off.
+        rows = store.all(
+            summary_select + " WHERE s.owner_id=? ORDER BY s.updated DESC,s.id DESC LIMIT ?",
+            (user["id"], limit),
+        )
+        return {"sessions": [recovery_summary(row) for row in rows], "enabled": _enabled()}
+
+    @app.get("/api/enrollment/sessions/{ident}/journey")
+    def get_journey(ident: str, user=Depends(admin)):
+        own_session(ident, user, require_active=False)
+        row = store.one(summary_select + " WHERE s.id=? AND s.owner_id=?", (ident, user["id"]))
+        pending = store.one(
+            "SELECT id FROM enrollment_operations WHERE session_id=? "
+            "AND kind IN ('voice_clone','vapi_assistant') AND state IN ('dispatching','outcome_unknown') LIMIT 1",
+            (ident,),
+        )
+        live = store.one("SELECT state FROM enrollment_realtime_calls WHERE session_id=?", (ident,))
+        provider_pending = bool(pending or (live and live["state"] == "close_unknown"))
+        return journey_summary(
+            row, enabled=_enabled(), provider_pending=provider_pending,
+            cleanup_state=cleanup_summary(ident) if row["revoked_at"] else "not_revoked",
+            interview_call_state=live["state"] if live else "none",
+        )
 
     @app.get("/api/enrollment/sessions/{ident}")
     def get_session(ident: str, user=Depends(admin)):
-        gate()
         row = own_session(ident, user, require_active=False)
         chunks = store.all(
             "SELECT seq,sha256,byte_count,duration_ms,mime,role FROM enrollment_chunks WHERE session_id=? ORDER BY seq",
@@ -918,25 +960,24 @@ training and do not claim to be the contributor. Session id: {ident}
 
     @app.post("/api/enrollment/sessions/{ident}/webrtc-close")
     async def close_webrtc(ident: str, user=Depends(admin)):
-        gate()
         own_session(ident, user, require_active=False)
         live = store.one(
             "SELECT call_id,state FROM enrollment_realtime_calls WHERE session_id=?",
             (ident,),
         )
-        if not live or live["state"] != "open":
+        if not live or live["state"] not in {"open", "close_unknown"}:
             return {"state": live["state"] if live else "none"}
         try:
             await app.state.enrollment_provider.openai_hangup(_require_key("OPENAI_API_KEY"), live["call_id"])
         except ProviderError as exc:
             store.execute(
-                "UPDATE enrollment_realtime_calls SET state='close_unknown',updated=? WHERE session_id=?",
-                (now(), ident),
+                "UPDATE enrollment_realtime_calls SET state='close_unknown',updated=? WHERE session_id=? AND call_id=?",
+                (now(), ident, live["call_id"]),
             )
             raise HTTPException(502, str(exc)) from None
         store.execute(
-            "UPDATE enrollment_realtime_calls SET state='closed',updated=? WHERE session_id=?",
-            (now(), ident),
+            "UPDATE enrollment_realtime_calls SET state='closed',updated=? WHERE session_id=? AND call_id=?",
+            (now(), ident, live["call_id"]),
         )
         return {"state": "closed"}
 
@@ -1303,7 +1344,6 @@ training and do not claim to be the contributor. Session id: {ident}
 
     @app.post("/api/enrollment/sessions/{ident}/revoke")
     async def revoke(ident: str, body: RevokeRequest, user=Depends(admin)):
-        gate()
         if not body.confirm:
             raise HTTPException(403, "Confirm revocation.")
         own_session(ident, user, require_active=False)
@@ -1327,7 +1367,6 @@ training and do not claim to be the contributor. Session id: {ident}
 
     @app.post("/api/enrollment/sessions/{ident}/cleanup")
     async def retry_cleanup(ident: str, user=Depends(admin)):
-        gate()
         row = own_session(ident, user, require_active=False)
         if not row["revoked_at"]:
             raise HTTPException(409, "Cleanup is only available after revocation.")

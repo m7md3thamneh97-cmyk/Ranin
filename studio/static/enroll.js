@@ -1,205 +1,161 @@
-const q=(s)=>document.querySelector(s);
-const app=q("#app");
-const notice=q("#notice");
-const S={token:sessionStorage.getItem("raneen-token")||"",user:null,status:null,session:null,pc:null,dc:null,stream:null,recorder:null,segmentActive:false,segmentStart:0,timer:null,seq:0,uploads:new Set(),lastItem:null,transcript:""};
-
-function esc(v){return String(v??"").replace(/[&<>"']/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-function flash(m){notice.textContent=m;notice.classList.add("show");clearTimeout(flash.t);flash.t=setTimeout(()=>notice.classList.remove("show"),6500);}
-function shell(h){app.innerHTML='<div class="shell"><div class="brand">RANEEN <span>VOICE ENROLLMENT</span></div>'+h+"</div>";}
-async function api(path,body,method){
-  const headers={Authorization:"Bearer "+S.token};
-  let payload;
-  if(body!==undefined){headers["Content-Type"]="application/json";payload=JSON.stringify(body);}
-  const r=await fetch(path,{method:method||(body===undefined?"GET":"POST"),headers,body:payload,credentials:"omit"});
-  if(!r.ok){let d="";try{d=(await r.json()).detail||"";}catch{}throw Error(d||("Request failed ("+r.status+")."));}
-  return r.json();
+import {InterviewCapture} from './enrollment-capture.js';
+import {copy} from './enrollment-copy.js';
+// Retire the earlier enrollment credential cache. This flow keeps access in memory.
+try { sessionStorage.removeItem('raneen-token'); } catch {}
+const q=(s)=>document.querySelector(s), app=q('#app');
+const S={lang:'ar',token:'',page:'login',sessions:[],session:null,journey:null,capture:null,transcript:'',lastItem:null,micEpoch:0,eventChain:Promise.resolve()};
+try { if(localStorage.getItem('raneen-language')==='en') S.lang='en'; } catch {}
+const remote=new Audio(); remote.autoplay=true;
+const t=(key)=>copy[S.lang][key]||key;
+const esc=(v)=>String(v??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=(ms)=>{const s=Math.floor((ms||0)/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');};
+function notice(message,error=false){const n=q('#notice');n.textContent=message;n.className='show'+(error?' error-notice':'');clearTimeout(notice.timer);notice.timer=setTimeout(()=>n.className='',9000);}
+function explain(e){
+  const names={NotAllowedError:'denied',NotFoundError:'missing',NotReadableError:'busyMic'};
+  const codes={recording_unsupported:'unsupported',save_audio_first:'saveFirst',connection_lost:'disconnected',audio_backpressure:'bufferFull',audio_not_saved:'saveFailed',audio_buffer_full:'bufferFull',final_audio_pending:'tailUnknown',recording_failed:'tailUnknown',upload_timeout:'saveFailed',audio_ack_missing:'saveFailed',request_timeout:'requestTimeout'};
+  return t(names[e?.name]||codes[e?.message]||({401:'accessExpired',403:'accessExpired',503:'unavailable',409:'conflict',413:'tooLarge'}[e?.status])||'failed');
 }
-function login(error){
-  app.innerHTML='<section class="login"><div class="brand">RANEEN <span>VOICE ENROLLMENT</span></div><div class="hero"><h1>Teach by talking.</h1><p>No transcript editing or training forms. This owner-only build learns from a spoken interview.</p></div><div class="card">'+(error?'<p class="error">'+esc(error)+"</p>":"")+'<label for="token">Private owner token</label><input id="token" type="password" autocomplete="off"><button class="primary" id="login">Open enrollment</button></div></section>';
-  q("#login").onclick=()=>{S.token=q("#token").value.trim();boot();};
-}
-async function boot(){
+const report=(e)=>notice(explain(e),true);
+async function request(url,options={}){
+  const token=S.token;
+  const ctrl=new AbortController(),external=options.signal,abort=()=>ctrl.abort();
+  external?.addEventListener('abort',abort,{once:true});if(external?.aborted)ctrl.abort();
+  const timer=setTimeout(abort,options.timeout||15000);
   try{
-    S.user=await api("/api/me");
-    if(S.user.role!=="admin")throw Error("Gate A is owner-only.");
-    sessionStorage.setItem("raneen-token",S.token);
-    S.status=await api("/api/enrollment/status");
-    if(!S.status.enabled)return disabled();
-    await startScreen();
-  }catch(e){login(e.message);}
+    const r=await fetch(url,{...options,headers:{Authorization:'Bearer '+token,...options.headers},credentials:'omit',signal:ctrl.signal});
+    if(!r.ok)throw Object.assign(Error('request_failed'),{status:r.status});
+    const result=options.text?await r.text():await r.json();
+    if(token!==S.token)throw Object.assign(Error('access_changed'),{status:401});
+    return result;
+  }catch(e){if(e.name==='AbortError')throw Error('request_timeout');throw e;}
+  finally{clearTimeout(timer);external?.removeEventListener('abort',abort);}
 }
-function disabled(){
-  shell('<div class="hero"><h1>Voice enrollment is installed but off.</h1><p>This release is fail-closed. An operator must review and enable <code>RANEEN_VOICE_ENROLLMENT_ENABLED=1</code> before any provider call can occur.</p></div><div class="card"><div class="status"><div><span class="small muted">OpenAI</span><strong>'+(S.status.openai_configured?"set":"missing")+'</strong></div><div><span class="small muted">ElevenLabs</span><strong>'+(S.status.elevenlabs_configured?"set":"missing")+'</strong></div><div><span class="small muted">Vapi</span><strong>'+((S.status.vapi_private_configured&&S.status.vapi_public_configured)?"set":"missing")+'</strong></div></div><a href="/">Back to Teaching Studio</a></div>');
+const post=(url,body={})=>request(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+const path=(suffix='')=>'/api/enrollment/sessions/'+encodeURIComponent(S.session)+suffix;
+function bind(id,handler){const el=q(id);if(el)el.onclick=()=>Promise.resolve().then(handler).catch(report);}
+function shell(content,withSteps=false){
+  document.documentElement.lang=S.lang;document.documentElement.dir=S.lang==='ar'?'rtl':'ltr';document.title=t('title');
+  app.innerHTML=`<div class="shell"><header class="topbar"><a class="brand" href="/enroll"><span class="brand-mark" aria-hidden="true">ر</span><span>${t('brand')}<small>${t('privateSpace')}</small></span></a><div class="header-actions"><button id="language" class="text-button" lang="${S.lang==='ar'?'en':'ar'}">${S.lang==='ar'?'English':'العربية'}</button>${S.token?`<button id="signout" class="text-button">${t('signout')}</button>`:''}</div></header>${withSteps?`<ol class="steps" aria-label="${t('journey')}">${['talk','prepare','test'].map((k,i)=>`<li ${i===0?'aria-current="step" class="current"':''}><span>${i+1}</span>${t(k)}</li>`).join('')}</ol>`:''}${content}<footer>${t('footer')}</footer></div>`;
+  bind('#language',()=>{stopMic();S.lang=S.lang==='ar'?'en':'ar';try{localStorage.setItem('raneen-language',S.lang);}catch{}render();});
+  bind('#signout',signout);
+  q('.brand').onclick=(e)=>{e.preventDefault();if(!S.token)login();else leave().then((ok)=>ok&&home()).catch(report);};
 }
-async function startScreen(){
-  const c=await api("/api/enrollment/consent");
-  shell('<div class="hero"><h1>Talk for 20–30 minutes.<br>Meet the agent it creates.</h1><p>The interviewer learns how you answer, what changes your decisions, and how you naturally phrase things. Your microphone is captured separately for a private voice clone.</p></div><div class="card"><h2>Before we start</h2><p class="small muted">'+esc(c.text)+'</p><label class="check"><input id="own" type="checkbox"><span>This is my own voice and I am choosing to enroll it.</span></label><label class="check"><input id="record" type="checkbox"><span>Record and store my microphone track for this private test.</span></label><label class="check"><input id="external" type="checkbox"><span>Use configured AI providers to interview, transcribe, clone, synthesize, and preview.</span></label><label class="check"><input id="clone" type="checkbox"><span>Create one private synthetic clone of my voice for this test.</span></label><label class="check"><input id="preview" type="checkbox"><span>Create a private AI preview agent using the clone. It must identify itself as AI.</span></label><p class="small warning">Use headphones. Speaker playback leaking into the microphone can contaminate voice samples.</p><button id="start" class="primary">Start voice enrollment</button></div><p class="small muted">No customer calls, phone numbers, CRM actions, or production Sura changes are part of this flow.</p>');
-  q("#start").onclick=async()=>{
-    try{
-      const r=await api("/api/enrollment/sessions",{self_attestation:q("#own").checked,recording:q("#record").checked,external_processing:q("#external").checked,voice_cloning:q("#clone").checked,private_preview:q("#preview").checked});
-      S.session=r.id;
-      await interviewScreen();
-    }catch(e){flash(e.message);}
-  };
+function hero(title,text,eyebrow=''){return `<section class="welcome"><p class="eyebrow">${eyebrow}</p><h1>${title}</h1><p class="lead">${text}</p></section>`;}
+function render(){({login,home:renderHome,consent:renderConsent,microphone:renderMic,interview:renderInterview}[S.page]||login)();}
+function login(error=''){
+  S.page='login';shell(hero(t('welcome'),t('intro'))+`<form id="loginForm" class="card login-card"><h2>${t('access')}</h2><p>${t('accessText')}</p>${error?`<p class="error" role="alert">${esc(error)}</p>`:''}<label for="token">${t('code')}</label><input id="token" type="password" required autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="codeNote"><p id="codeNote" class="small muted">${t('codeNote')}</p><button class="primary" id="login" type="submit">${t('continue')}</button></form>`);
+  q('#loginForm').onsubmit=async(e)=>{e.preventDefault();const b=q('#login');if(b.disabled)return;b.disabled=true;S.token=q('#token').value.trim();try{const u=await request('/api/me');if(u.role!=='admin')throw Object.assign(Error(),{status:403});await home();}catch(e){S.token='';login(explain(e));}};
 }
-function fmt(ms){const s=Math.floor(ms/1000);return Math.floor(s/60)+":"+String(s%60).padStart(2,"0");}
-async function state(){return api("/api/enrollment/sessions/"+S.session);}
-async function interviewScreen(){
-  const st=await state();
-  S.seq=st.chunks.length?Math.max(...st.chunks.map((x)=>x.seq))+1:0;
-  const confirmed=st.evidence.filter((x)=>x.status==="confirmed").length;
-  const pct=Math.min(100,st.clean_ms/(20*60*1000)*100);
-  shell('<div class="hero"><h1>Have the conversation.</h1><p>The interviewer adapts as you speak. Answer naturally. It will sometimes ask whether it understood a pattern correctly.</p></div><div class="card"><div id="orb" class="orb '+(S.pc?"live":"paused")+'">'+(S.pc?"LIVE":"READY")+'</div><div class="status"><div><span class="small muted">Mic captured</span><strong id="captured">'+fmt(st.clean_ms)+'</strong></div><div><span class="small muted">Confirmed patterns</span><strong>'+confirmed+'</strong></div><div><span class="small muted">Voice</span><strong>'+esc(st.voice_state)+'</strong></div></div><div class="progress"><span id="progress" style="width:'+pct+'%"></span></div><p class="small muted">20 minutes is the target interview length. Captured microphone time is not a quality score.</p><div class="row"><button id="connect" class="primary">'+(S.pc?"Interview running":"Start / resume interview")+'</button><button id="pause" class="secondary" '+(S.pc?"":"disabled")+'>Pause</button><button id="refresh" class="secondary">Refresh progress</button></div><h3>Latest words heard</h3><div id="transcript" class="transcript" dir="auto">'+esc(S.transcript||"Nothing transcribed yet.")+'</div></div><div class="card"><h2>Create the voice when enough microphone audio is available</h2><p class="small muted">The clone uses only your microphone chunks. Raneen then synthesizes new Arabic speech that was not recorded during enrollment.</p><button id="cloneBtn" class="primary">Create / check my private voice clone</button><div id="voiceResult"></div></div><div class="row"><button id="revoke" class="secondary danger">Revoke this enrollment</button><a href="/">Back to teaching studio</a></div>');
-  q("#connect").onclick=()=>connectInterview().catch((e)=>flash(e.message));
-  q("#pause").onclick=()=>pauseInterview().catch((e)=>flash(e.message));
-  q("#refresh").onclick=()=>interviewScreen().catch((e)=>flash(e.message));
-  q("#cloneBtn").onclick=()=>cloneVoice().catch((e)=>flash(e.message));
-  q("#revoke").onclick=async()=>{
-    if(!confirm("Revoke this enrollment and immediately block local use?"))return;
-    await pauseInterview();
-    const r=await api("/api/enrollment/sessions/"+S.session+"/revoke",{confirm:true});
-    flash("Revoked. Provider cleanup: "+r.provider_cleanup+".");
-    S.session=null;
-    await startScreen();
-  };
+async function home(){stopMic();clearInterval(S.poll);const r=await request('/api/enrollment/sessions');S.sessions=r.sessions;S.enabled=r.enabled;S.page='home';renderHome();}
+function renderHome(){
+  S.page='home';const latest=S.sessions.find((s)=>!s.revoked&&!['complete','failed'].includes(s.state));
+  shell(hero(latest?t('welcomeBack'):t('homeTitle'),t('homeText'))+`<section class="card feature-card"><div><span class="pill">${t('owner')}</span><h2>${latest?t('savedTitle'):t('newTitle')}</h2><p>${latest?`${t('saved')}: <strong dir="ltr">${fmt(latest.saved_audio_ms)}</strong>`:t('newText')}</p>${!S.enabled?`<p class="status-note">${t('disabled')}</p>`:''}</div><button id="mainAction" class="primary" ${!latest&&!S.enabled?'disabled':''}>${latest?(S.enabled?t('resume'):t('view')):t('begin')}</button></section><div class="journey-cards">${[['talk','talkText'],['prepare','prepareText'],['test','testText']].map(([title,txt],i)=>`<div><span>0${i+1}</span><h3>${t(title)}</h3><p>${t(txt)}</p>${i?`<span class="small muted">${t('later')}</span>`:''}</div>`).join('')}</div>${S.sessions.length?`<details class="card"><summary>${t('history')}</summary><ul class="session-list">${S.sessions.map((s,i)=>`<li><div><strong>${t('interview')} ${i+1}</strong><p class="small muted">${s.revoked?t('revoked'):t('saved')} · <span dir="ltr">${fmt(s.saved_audio_ms)}</span></p></div><button class="secondary" data-session="${esc(s.id)}">${t('open')}</button></li>`).join('')}</ul></details>`:''}`);
+  bind('#mainAction',()=>latest?openSession(latest.id):consent());
+  app.querySelectorAll('[data-session]').forEach((b)=>b.onclick=()=>openSession(b.dataset.session).catch(report));
 }
-async function connectInterview(){
-  if(S.pc)return;
-  if(!navigator.mediaDevices?.getUserMedia||!window.RTCPeerConnection||!window.MediaRecorder)throw Error("Use a current HTTPS browser with microphone and WebRTC support.");
-  const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
-  S.stream=stream;
-  startSegments();
-  const pc=new RTCPeerConnection();
-  S.pc=pc;
-  const remote=document.createElement("audio");
-  remote.autoplay=true;
-  pc.ontrack=(e)=>{remote.srcObject=e.streams[0];};
-  stream.getAudioTracks().forEach((track)=>pc.addTrack(track,stream));
-  const dc=pc.createDataChannel("oai-events");
-  S.dc=dc;
-  dc.onopen=()=>{
-    flash("Interview connected. Speak naturally.");
-    dc.send(JSON.stringify({type:"response.create",response:{instructions:"Greet the contributor briefly, say this is a private AI enrollment interview, then ask one natural conversational question."}}));
-  };
-  dc.onmessage=(event)=>{let evt;try{evt=JSON.parse(event.data);}catch{return;}handleRealtime(evt).catch((e)=>flash(e.message));};
-  dc.onerror=()=>flash("Realtime data channel error.");
-  pc.onconnectionstatechange=()=>{if(["failed","closed","disconnected"].includes(pc.connectionState)&&S.pc===pc)flash("Interview connection ended. Saved microphone chunks remain on the server.");};
-  const offer=await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  const r=await fetch("/api/enrollment/sessions/"+S.session+"/webrtc",{method:"POST",credentials:"omit",body:offer.sdp,headers:{Authorization:"Bearer "+S.token,"Content-Type":"application/sdp"}});
-  if(!r.ok){let d="";try{d=(await r.json()).detail||"";}catch{}await stopLocalMedia();pc.close();S.pc=null;throw Error(d||("Realtime WebRTC connection failed ("+r.status+")."));}
-  await pc.setRemoteDescription({type:"answer",sdp:await r.text()});
-  await interviewScreen();
+async function consent(){S.consent=await request('/api/enrollment/consent');S.page='consent';renderConsent();}
+function renderConsent(){
+  shell(hero(t('consentTitle'),t('consentIntro'),t('before'))+`<form class="card" id="consentForm"><fieldset><legend>${t('consentLegend')}</legend>${['own','record','external','clone','preview'].map((k)=>`<label class="check"><input id="${k}" type="checkbox" required><span>${t(k)}</span></label>`).join('')}</fieldset><p class="status-note">${t('withdrawNote')}</p><details class="consent-details"><summary>${t('fullConsent')}</summary><p dir="auto" lang="en">${esc(S.consent.text)}</p></details><button id="accept" class="primary" type="submit">${t('accept')}</button><button id="back" type="button" class="text-button">${t('back')}</button></form>`,true);
+  bind('#back',home);q('#consentForm').onsubmit=async(e)=>{e.preventDefault();const b=q('#accept');if(b.disabled)return;b.disabled=true;try{const r=await post('/api/enrollment/sessions',{self_attestation:q('#own').checked,recording:q('#record').checked,external_processing:q('#external').checked,voice_cloning:q('#clone').checked,private_preview:q('#preview').checked});await openSession(r.id,true);}catch(e){b.disabled=false;report(e);}};
 }
-async function handleRealtime(evt){
-  if(evt.type==="conversation.item.input_audio_transcription.completed"){
-    S.lastItem=evt.item_id;
-    S.transcript=evt.transcript||"";
-    await api("/api/enrollment/sessions/"+S.session+"/transcripts",{item_id:evt.item_id,transcript:S.transcript});
-    if(q("#transcript"))q("#transcript").textContent=S.transcript;
-    return;
-  }
-  if(evt.type==="response.done"&&Array.isArray(evt.response?.output)){
-    for(const item of evt.response.output){
-      if(item.type!=="function_call")continue;
-      let args={};try{args=JSON.parse(item.arguments||"{}");}catch{continue;}
-      const result=await api("/api/enrollment/sessions/"+S.session+"/tool",{call_id:item.call_id,name:item.name,arguments:args,source_item_id:S.lastItem});
-      if(S.dc?.readyState==="open"){
-        S.dc.send(JSON.stringify({type:"conversation.item.create",item:{type:"function_call_output",call_id:item.call_id,output:JSON.stringify(result)}}));
-        S.dc.send(JSON.stringify({type:"response.create"}));
-      }
+async function openSession(id,mic=false){
+  if(S.session!==id&&S.capture?.hasPending){notice(t('saveFirst'),true);return;}
+  S.session=id;const journey=await request('/api/enrollment/sessions/'+encodeURIComponent(id)+'/journey');
+  if(S.session!==id)return;S.journey=journey;
+  if(!S.capture||S.capture.sessionId!==id)createCapture();
+  S.capture.queue.syncNextSeq(S.journey.next_seq);S.page=mic&&S.journey.can_resume?'microphone':'interview';render();
+  clearInterval(S.poll);S.poll=setInterval(()=>{if(S.page==='interview')refresh().catch(()=>{});},10000);
+}
+function renderMic(){
+  S.page='microphone';shell(hero(t('micTitle'),t('micIntro'))+`<section class="card mic-card"><div class="mic-symbol" aria-hidden="true">♪</div><h2 id="micStatus">${t('micReady')}</h2><p>${t('headphones')}</p><div class="mic-meter" role="meter" aria-label="${t('micLevel')}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="micLevel"></span></div><p class="small muted">${t('micPrivacy')}</p><div class="actions"><button id="checkMic" class="primary">${t('checkMic')}</button><button id="micContinue" class="primary" hidden>${t('micContinue')}</button><button id="micBack" class="secondary">${t('back')}</button></div><p id="micTip" class="small" role="status"></p></section>`,true);
+  bind('#checkMic',checkMic);const done=()=>{stopMic();S.page='interview';renderInterview();};bind('#micContinue',done);bind('#micBack',done);
+}
+function stopMic(){++S.micEpoch;cancelAnimationFrame(S.micFrame);S.micStream?.getTracks().forEach((x)=>x.stop());S.micStream=null;S.micContext?.close().catch(()=>{});S.micContext=null;}
+async function checkMic(){
+  const b=q('#checkMic');if(b.disabled)return;b.disabled=true;const epoch=++S.micEpoch;q('#micStatus').textContent=t('micAllow');
+  try{
+    if(!navigator.mediaDevices?.getUserMedia)throw Error('recording_unsupported');
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+    if(epoch!==S.micEpoch){stream.getTracks().forEach((x)=>x.stop());return;}
+    S.micStream=stream;q('#micStatus').textContent=t('micSpeak');q('#micTip').textContent=t('micTip');b.hidden=true;q('#micContinue').hidden=false;
+    const Context=window.AudioContext||window.webkitAudioContext;if(!Context)return;
+    const ctx=new Context();S.micContext=ctx;await ctx.resume();if(epoch!==S.micEpoch)return;
+    const analyser=ctx.createAnalyser();analyser.fftSize=256;ctx.createMediaStreamSource(stream).connect(analyser);const samples=new Uint8Array(analyser.fftSize);
+    const tick=()=>{if(epoch!==S.micEpoch)return;analyser.getByteTimeDomainData(samples);const rms=Math.sqrt(samples.reduce((n,x)=>n+((x-128)/128)**2,0)/samples.length),level=Math.min(100,Math.round(rms*500));q('#micLevel').style.width=level+'%';q('.mic-meter').setAttribute('aria-valuenow',String(level));S.micFrame=requestAnimationFrame(tick);};tick();
+  }catch(e){if(epoch===S.micEpoch){stopMic();renderMic();report(e);}}
+}
+function createCapture(){
+  const id=S.session,base='/api/enrollment/sessions/'+encodeURIComponent(id);
+  S.capture=new InterviewCapture({sessionId:id,nextSeq:S.journey.next_seq,
+    upload:(item,signal)=>request(base+'/chunks/'+item.seq,{method:'PUT',signal,body:item.blob,headers:{'Content-Type':item.blob.type||'audio/webm','X-Speaker-Role':'contributor','X-Chunk-Sha256':item.checksum,'X-Duration-Ms':String(item.durationMs)}}),
+    openConnection:(sdp)=>request(base+'/webrtc',{method:'POST',body:sdp,headers:{'Content-Type':'application/sdp'},text:true,timeout:35000}),
+    closeConnection:async()=>{const r=await post(base+'/webrtc-close');if(S.session===id)await refresh();return r;},
+    onState:update,onError:report,onAck:()=>{if(S.session===id)refresh().catch(()=>{});},
+    onRemote:(stream)=>{remote.srcObject=stream;if(stream)remote.play().catch(()=>notice(t('blockedAudio'),true));},
+    onEvent:(event,capture)=>{S.eventChain=S.eventChain.then(()=>realtime(event,capture)).catch(report);return S.eventChain;},
+  });S.transcript='';S.lastItem=null;
+}
+function renderInterview(){
+  S.page='interview';const j=S.journey;
+  shell(hero(j.revoked?t('revokedTitle'):t('interviewTitle'),j.revoked?t('revokedText'):t('interviewIntro'),t('privateInterview'))+`<section class="card interview-card"><div class="interview-top"><span id="connectionStatus" class="pill" role="status">${t('off')}</span><span class="small muted">${t('target')}</span></div><div id="orb" class="orb" aria-hidden="true">ر</div><h2 id="interviewHint">${t('ready')}</h2><p id="interviewSupport">${t('reassurance')}</p><div class="saved-progress"><strong id="savedMinutes" dir="ltr">${fmt(j.saved_audio_ms)}</strong><span>${t('saved')}</span></div><p class="small muted">${t('durationNote')}</p><div id="uploadState" class="save-state" role="status"></div><p id="serverState" class="status-note" hidden></p><div class="actions"><button id="connect" class="primary">${t('start')}</button><button id="pause" class="secondary" hidden>${t('pause')}</button><button id="retryUploads" class="primary" hidden>${t('retry')}</button><button id="ackTail" class="secondary" hidden>${t('acknowledgeTail')}</button><button id="endPrevious" class="secondary" hidden>${t('endPrevious')}</button><button id="micCheck" class="text-button">${t('checkSound')}</button></div><p class="small muted">${t('headphones')}</p></section><details class="card"><summary>${t('details')}</summary><h3>${t('latest')}</h3><div id="transcript" class="transcript" dir="auto">${esc(S.transcript||t('emptyTranscript'))}</div><p class="small muted">${t('transcriptNote')}</p><p>${t('patterns')}: <strong id="patterns">${j.confirmed_patterns||0}</strong></p><button id="refresh" class="secondary">${t('refresh')}</button></details><section class="card next-stage"><div class="next-icon" aria-hidden="true">2</div><div><h2>${t('nextTitle')}</h2><p>${t('nextText')}</p><span class="pill neutral">${t('notAvailable')}</span></div></section><div class="bottom-actions"><button id="backHome" class="text-button">${t('backHome')}</button>${j.revoked?`<button id="cleanup" class="secondary">${t('cleanup')}</button>`:`<button id="revoke" class="text-button danger">${t('revoke')}</button>`}</div>${j.revoked?`<p class="small muted">${t('cleanupNote')}</p>`:''}`,true);
+  bind('#connect',async()=>{try{if(S.journey.can_resume)await S.capture.start();}finally{update();}});
+  bind('#pause',async()=>{await S.capture.pause();await refresh();});
+  bind('#retryUploads',async()=>{const ok=await S.capture.retry();notice(ok?t('allSaved'):t('saveFailed'),!ok);await refresh();});
+  bind('#ackTail',()=>{if(confirm(t('acknowledgeConfirm')))S.capture.acknowledgeMissingTail();});
+  bind('#endPrevious',async()=>{q('#endPrevious').disabled=true;try{await post(path('/webrtc-close'));await refresh();}finally{if(q('#endPrevious'))q('#endPrevious').disabled=false;}});
+  bind('#micCheck',async()=>{if(await leave()){S.page='microphone';renderMic();}});
+  bind('#refresh',refresh);bind('#backHome',async()=>{if(await leave())await home();});bind('#revoke',revoke);
+  bind('#cleanup',async()=>{await post(path('/cleanup'));notice(t('cleanupNote'));await refresh();});update();
+}
+function update(){
+  if(S.page!=='interview'||!S.capture||!q('#connect'))return;
+  const c=S.capture,j=S.journey,live=c.state==='live',connecting=c.state==='connecting',pending=c.hasPending;
+  const previous=!live&&!connecting&&['open','close_unknown'].includes(j.interview_call_state);
+  const missingOnly=c.uncertainTail&&!c.queue.hasPending&&!c.unsavedFinal&&!c.pausing;
+  const oversize=c.queue.items.some((x)=>x.blob.size>80*1024)||c.unsavedFinal?.blob.size>80*1024;
+  q('#connectionStatus').textContent=t(j.revoked?'revoked':live?'active':connecting?'connecting':'off');q('#orb').classList.toggle('live',live);
+  q('#interviewHint').textContent=t(j.revoked?'revoked':live?'listening':connecting?'connectingHint':pending?'saving':j.can_resume?'ready':'off');
+  q('#interviewSupport').textContent=t(live?'liveNote':connecting?'permissionWait':'reassurance');
+  q('#connect').hidden=live||connecting||pending||previous||j.revoked;q('#connect').disabled=!j.can_resume||Boolean(c.starting||c.pausing);q('#connect').textContent=t(j.chunk_count?'resumeTalk':'start');
+  q('#pause').hidden=!(live||connecting);q('#pause').textContent=t(connecting?'cancel':'pause');
+  q('#retryUploads').hidden=!pending||live||connecting||j.revoked||missingOnly||oversize;q('#retryUploads').disabled=Boolean(c.queue.running||c.pausing);
+  q('#ackTail').hidden=!missingOnly||j.revoked;q('#endPrevious').hidden=!previous;
+  q('#micCheck').disabled=live||connecting||pending||j.revoked;
+  q('#uploadState').textContent=j.revoked?t('revokedText'):oversize?t('tooLarge'):missingOnly?t('lostTail'):c.uncertainTail||c.unsavedFinal?t('tailUnknown'):pending?`${t('waiting')} ${c.queue.items.length}. ${t('keepOpen')}`:j.chunk_count?t('allSaved'):t('noAudio');
+  q('#uploadState').classList.toggle('unsaved',pending);
+  const key=previous?(j.interview_call_state==='close_unknown'?'closeUnknown':'previousOpen'):j.revoked&&['manual_reconciliation','pending'].includes(j.cleanup_state)?'cleanupNote':j.revoked?'':!j.enabled?'disabled':!j.can_resume&&!live&&!connecting?'reviewNeeded':'';
+  q('#serverState').hidden=!key;q('#serverState').textContent=key?t(key):'';
+}
+async function refresh(){
+  const id=S.session;if(!id)return;const j=await request(path('/journey'));if(id!==S.session)return;
+  S.journey=j;S.capture?.queue.syncNextSeq(j.next_seq);
+  if(j.revoked&&(S.capture?.stream||S.capture?.starting))S.capture.pause({save:false}).catch(report);
+  if(q('#savedMinutes'))q('#savedMinutes').textContent=fmt(j.saved_audio_ms);if(q('#patterns'))q('#patterns').textContent=j.confirmed_patterns||0;update();
+}
+async function realtime(event,capture){
+  if(capture!==S.capture||S.journey?.revoked)return;
+  const base='/api/enrollment/sessions/'+encodeURIComponent(capture.sessionId);
+  if(event.type==='raneen.connected')capture.send({type:'response.create',response:{instructions:'Introduce yourself briefly as Raneen’s private AI interviewer. Ask in Arabic which language and dialect the contributor prefers, respect their spoken choice, and ask one natural question at a time. Do not claim a finished clone.'}});
+  else if(event.type==='conversation.item.input_audio_transcription.completed'){
+    await post(base+'/transcripts',{item_id:event.item_id,transcript:event.transcript||''});
+    if(capture!==S.capture||S.journey?.revoked)return;
+    capture.lastItem=event.item_id;S.transcript=event.transcript||'';if(q('#transcript'))q('#transcript').textContent=S.transcript;
+  }else if(event.type==='response.done'&&Array.isArray(event.response?.output)){
+    for(const item of event.response.output){if(item.type!=='function_call')continue;let args;try{args=JSON.parse(item.arguments||'{}');}catch{continue;}
+      if(capture!==S.capture||S.journey?.revoked)return;
+      const result=await post(base+'/tool',{call_id:item.call_id,name:item.name,arguments:args,source_item_id:capture.lastItem||null});
+      if(capture!==S.capture||S.journey?.revoked)return;
+      capture.send({type:'conversation.item.create',item:{type:'function_call_output',call_id:item.call_id,output:JSON.stringify(result)}});capture.send({type:'response.create'});
     }
-  }
-  if(evt.type==="error")flash("Interviewer reported an error. Pause and retry if it persists.");
+  }else if(event.type==='error')notice(t('interviewerError'),true);
 }
-function mimeChoice(){for(const m of ["audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus","audio/ogg"])if(MediaRecorder.isTypeSupported(m))return m;throw Error("This browser does not expose a supported microphone recording format.");}
-function startSegments(){
-  S.segmentActive=true;
-  const run=()=>{
-    if(!S.segmentActive||!S.stream?.active)return;
-    if(S.uploads.size>=4){S.timer=setTimeout(run,700);return;}
-    const mime=mimeChoice(),parts=[];
-    const rec=new MediaRecorder(S.stream,{mimeType:mime,audioBitsPerSecond:128000});
-    let resolveDone;
-    S.segmentDone=new Promise((resolve)=>{resolveDone=resolve;});
-    S.recorder=rec;S.segmentStart=performance.now();
-    rec.ondataavailable=(e)=>{if(e.data?.size)parts.push(e.data);};
-    rec.onstop=async()=>{
-      const duration=Math.max(250,Math.round(performance.now()-S.segmentStart));
-      const blob=new Blob(parts,{type:mime});
-      if(S.segmentActive)run();
-      try{
-        if(!blob.size)return;
-        const seq=S.seq++;
-        const p=uploadChunk(seq,blob,duration).catch((e)=>{flash(e.message);S.segmentActive=false;throw e;}).finally(()=>S.uploads.delete(p));
-        S.uploads.add(p);
-        await p;
-      }finally{resolveDone();}
-    };
-    rec.start();
-    S.timer=setTimeout(()=>{if(rec.state==="recording")rec.stop();},3000);
-  };
-  run();
+async function leave(){stopMic();const capture=S.capture;if(capture)await capture.pause();if(capture!==S.capture)return false;if(capture?.hasPending){notice(t('keepOpen'),true);return false;}return true;}
+async function revoke(){
+  if(!confirm(t('revokeConfirm')))return;const id=S.session,capture=S.capture;stopMic();capture?.pause({save:false}).catch(report);q('#revoke').disabled=true;
+  try{await post('/api/enrollment/sessions/'+encodeURIComponent(id)+'/revoke',{confirm:true});if(S.session!==id||S.capture!==capture)return;S.capture=null;await openSession(id);notice(t('revokedText'));}catch(e){if(S.session===id&&q('#revoke'))q('#revoke').disabled=false;report(e);}
 }
-async function hash(blob){const h=await crypto.subtle.digest("SHA-256",await blob.arrayBuffer());return [...new Uint8Array(h)].map((x)=>x.toString(16).padStart(2,"0")).join("");}
-async function uploadChunk(seq,blob,duration){
-  if(blob.size>80*1024)throw Error("A microphone chunk exceeded the safe upload size; pause and retry.");
-  const r=await fetch("/api/enrollment/sessions/"+S.session+"/chunks/"+seq,{method:"PUT",credentials:"omit",body:blob,headers:{Authorization:"Bearer "+S.token,"Content-Type":blob.type||"audio/webm","X-Speaker-Role":"contributor","X-Chunk-Sha256":await hash(blob),"X-Duration-Ms":String(duration)}});
-  if(!r.ok){let d="";try{d=(await r.json()).detail||"";}catch{}throw Error(d||("Audio chunk "+seq+" failed ("+r.status+")."));}
-  const st=await state();
-  if(q("#captured"))q("#captured").textContent=fmt(st.clean_ms);
-  if(q("#progress"))q("#progress").style.width=Math.min(100,st.clean_ms/(20*60*1000)*100)+"%";
-}
-async function stopLocalMedia(){
-  S.segmentActive=false;clearTimeout(S.timer);
-  const finalSegment=S.segmentDone;
-  if(S.recorder?.state==="recording")S.recorder.stop();
-  try{
-    await Promise.race([
-      finalSegment,
-      new Promise((_,reject)=>setTimeout(()=>reject(Error("Final microphone chunk did not close cleanly.")),5000))
-    ]);
-  }finally{
-    S.stream?.getTracks().forEach((t)=>t.stop());
-    S.stream=null;
-  }
-}
-async function pauseInterview(){
-  try{await stopLocalMedia();}catch(e){flash(e.message);}
-  if(S.session&&S.token){
-    try{await api("/api/enrollment/sessions/"+S.session+"/webrtc-close",{});}catch(e){flash("Server could not confirm interview hangup; the hard timeout remains active.");}
-  }
-  if(S.dc?.readyState==="open")S.dc.close();
-  S.pc?.close();S.pc=null;S.dc=null;
-  await Promise.allSettled([...S.uploads]);S.uploads.clear();
-  await interviewScreen();
-}
-async function cloneVoice(){
-  const result=await api("/api/enrollment/sessions/"+S.session+"/clone",{approve:true});
-  const target=q("#voiceResult");
-  if(result.state==="verification_required"){target.innerHTML='<p class="warning">ElevenLabs requires speaker verification. Raneen will not bypass it.</p>';return;}
-  if(result.state==="outcome_unknown"){target.innerHTML='<p class="warning">Provider outcome is uncertain. Automatic retry is blocked to avoid duplicates.</p>';return;}
-  if(result.state!=="ready")throw Error("Voice clone is not ready.");
-  target.innerHTML='<p class="ready">Voice clone created. Generating new speech…</p>';
-  const clips=[];
-  for(const kind of ["question","number","correction"]){
-    const r=await fetch("/api/enrollment/sessions/"+S.session+"/preview",{method:"POST",credentials:"omit",headers:{Authorization:"Bearer "+S.token,"Content-Type":"application/json"},body:JSON.stringify({approve:true,kind})});
-    if(!r.ok){let d="";try{d=(await r.json()).detail||"";}catch{}throw Error(d||("Preview "+kind+" failed."));}
-    clips.push({kind,url:URL.createObjectURL(await r.blob())});
-  }
-  target.innerHTML='<p class="ready">Fresh synthesized Arabic speech:</p><div class="grid">'+clips.map((x)=>'<div class="audio-card"><strong>'+esc(x.kind)+'</strong><audio controls src="'+x.url+'"></audio></div>').join("")+'</div><div class="row" style="margin-top:16px"><button id="buildAgent" class="primary">Build my personalized test agent</button><button id="continueTeaching" class="secondary">Continue teaching</button></div>';
-  q("#buildAgent").onclick=()=>buildAgent().catch((e)=>flash(e.message));
-  q("#continueTeaching").onclick=()=>interviewScreen().catch((e)=>flash(e.message));
-}
-async function buildAgent(){
-  const behavior=await api("/api/enrollment/sessions/"+S.session+"/behavior",{approve:true});
-  const assistant=await api("/api/enrollment/sessions/"+S.session+"/assistant",{approve:true,behavior_id:behavior.id});
-  const cfg=await api("/api/enrollment/sessions/"+S.session+"/preview-config");
-  sessionStorage.removeItem("raneen-token");
-  S.token="";
-  shell('<div class="hero"><h1>Meet the test agent.</h1><p>This is AI using the private cloned voice and behavior version '+behavior.version+'. It is not the human speaker and has no production tools or phone number.</p></div><div class="card"><h2>Talk to the agent</h2><p class="small muted">For security, your owner token has been cleared before loading the third-party voice widget. Returning to teaching requires signing in again.</p><iframe id="previewFrame" title="Raneen private Vapi preview" sandbox="allow-scripts allow-same-origin allow-forms" allow="microphone" style="width:100%;height:430px;border:0;border-radius:14px"></iframe></div><div class="card"><h2>Want to change how it responds?</h2><p>End the preview, return to enrollment, sign in, and teach the correction by voice. The next behavior version reuses the same voice clone.</p><a class="primary" href="/enroll">Return to voice enrollment</a></div>');
-  const frame=q("#previewFrame");
-  frame.src="/vapi-frame#"+encodeURIComponent(JSON.stringify({assistant_id:assistant.assistant_id,public_key:cfg.public_key,max_duration_seconds:cfg.max_duration_seconds}));
-}
-window.addEventListener("beforeunload",(e)=>{if(S.pc||S.uploads.size){e.preventDefault();e.returnValue="";}});
-if(S.token)boot();else login();
+async function signout(){if(!await leave())return;clearInterval(S.poll);S.token='';S.session=null;S.capture=null;S.journey=null;S.sessions=[];S.transcript='';login();}
+window.addEventListener('beforeunload',(e)=>{if(S.capture?.hasPending||S.capture?.stream||S.capture?.starting){e.preventDefault();e.returnValue='';}});
+window.addEventListener('pagehide',()=>{stopMic();S.capture?.stopLocal();});
+window.addEventListener('offline',()=>{if(S.capture?.stream||S.capture?.starting)S.capture.pause().then(()=>notice(t('disconnected'),true)).catch(report);});
+login();

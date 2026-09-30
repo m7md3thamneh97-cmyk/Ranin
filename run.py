@@ -3,7 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import uvicorn
-from studio.app import create_app
+from studio.runtime import create_app
 
 
 def main():
@@ -21,7 +21,7 @@ def main():
     if not store.one("SELECT id FROM users WHERE role='admin' LIMIT 1"):
         user = store.create_user('Workspace owner', 'admin')
         print(f"\nFIRST-RUN ADMIN TOKEN (shown once):\n{user['token']}\n", flush=True)
-    print(f'Open http://localhost:{args.port}\nLocal prototype only. No external AI services are connected.', flush=True)
+    print(f'Open http://localhost:{args.port}/enroll\nLocal owner development. Voice enrollment is off by default; live provider use requires operator approval.', flush=True)
     uvicorn.run(app, host='127.0.0.1', port=args.port, access_log=False, proxy_headers=False)
 
 if __name__ == '__main__':
