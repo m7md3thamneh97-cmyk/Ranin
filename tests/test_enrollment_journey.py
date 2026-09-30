@@ -137,7 +137,7 @@ def test_feature_off_blocks_new_work_without_provider_creation(env, monkeypatch)
     monkeypatch.setenv("RANEEN_VOICE_ENROLLMENT_ENABLED", "0")
     assert client.post("/api/enrollment/sessions", headers=auth(owner), json=SCOPES).status_code == 404
     for action, body in [
-        ("clone", {"approve": True}),
+        ("clone", {"approve": True,"final_seq":0}),
         ("assistant", {"approve": True, "behavior_id": "synthetic-behavior"}),
         ("behavior", {"approve": True}),
     ]:
@@ -163,7 +163,7 @@ def test_get_projection_preserves_saved_counts_without_quality_or_private_data_c
     data = response.json()
     assert data["saved_audio_ms"] == 4000
     assert data["chunk_count"] == 1 and data["next_seq"] == 5
-    assert data["confirmed_patterns"] == 1 and data["pending_patterns"] == 1
+    assert data["confirmed_patterns"] == 0 and data["pending_patterns"] == 1  # Legacy browser confirmations lack trusted audio provenance.
     assert data["stage"] == "interview" and data["can_resume"] is True
     assert data["preview_allowed"] is False
     assert "clean_ms" not in data and "voice_ready" not in data
@@ -198,7 +198,9 @@ def test_legacy_voice_state_never_enables_preview(env, voice_state, stage):
     store.execute("UPDATE enrollment_sessions SET voice_state=?,voice_id=? WHERE id=?", (voice_state, "voice_synthetic", sid))
     state = client.get(f"/api/enrollment/sessions/{sid}/journey", headers=auth(owner)).json()
     assert state["stage"] == stage
-    assert state["preview_allowed"] is False and state["can_resume"] is False
+    assert state["preview_allowed"] is False
+    # The approved voice is reused while the contributor teaches corrections.
+    assert state["can_resume"] is (voice_state == "ready")
     assert "voice_id" not in state
 
 

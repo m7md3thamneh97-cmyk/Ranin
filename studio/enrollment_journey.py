@@ -48,7 +48,10 @@ def journey_summary(row: dict, *, enabled: bool, provider_pending: bool, cleanup
         "suggested_action": action,
         "provider_pending": provider_pending or row["voice_state"] == "outcome_unknown",
         "interview_call_state": interview_call_state,
-        "can_resume": enabled and stage == "interview" and interview_call_state != "open" and row["state"] not in {"complete", "failed"},
+        "can_resume": enabled and not revoked and not provider_pending
+        and row["voice_state"] not in {"verification_required", "outcome_unknown"}
+        and interview_call_state not in {"open", "close_unknown"}
+        and row["state"] not in {"complete", "failed"},
         "cleanup_state": cleanup_state,
         # Provider voice IDs and the legacy ready flag do not establish accepted,
         # playable speech or a bounded browser call. Keep this explicit in the UI.

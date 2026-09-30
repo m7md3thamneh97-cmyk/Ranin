@@ -8,6 +8,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -256,10 +257,12 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Cache-Control'] = 'no-store'
         if request.url.path == '/vapi-frame':
-            response.headers['Content-Security-Policy'] = ("default-src 'none'; script-src 'self' https://unpkg.com; "
-                "style-src 'self' 'unsafe-inline'; connect-src https://api.vapi.ai https://*.vapi.ai wss://*.vapi.ai "
-                "https://*.daily.co wss://*.daily.co; media-src blob: https://*.daily.co; "
-                "img-src data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
+            response.headers['Content-Security-Policy'] = ("default-src 'none'; script-src 'self' "
+                "https://c.daily.co/call-machine/versioned/0.87.0/static/call-machine-object-bundle.js; "
+                "style-src 'self' 'unsafe-inline'; connect-src 'self' https://*.daily.co wss://*.daily.co; "
+                "media-src 'self' blob: https://*.daily.co; worker-src 'self' blob:; "
+                "frame-src https://*.daily.co; img-src data:; object-src 'none'; "
+                "frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
         elif request.url.path == '/enroll':
             response.headers['Content-Security-Policy'] = ("default-src 'self'; script-src 'self'; style-src 'self'; "
                 "img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; "
@@ -305,6 +308,26 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
     def healthz():
         store.one('SELECT 1 AS ok')
         return dict(status='ok')
+
+    @app.get('/readyz', include_in_schema=False)
+    def readiness():
+        """Public deployment diagnostics: configuration presence, never credentials/data."""
+        revision = os.environ.get('RENDER_GIT_COMMIT', '')
+        if len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
+            revision = None
+        return {
+            'application': 'raneen-owner-platform',
+            'revision': revision,
+            'enrollment_enabled': os.environ.get('RANEEN_VOICE_ENROLLMENT_ENABLED', '0').strip() == '1',
+            'providers_configured': {
+                'openai': bool(os.environ.get('OPENAI_API_KEY', '').strip()),
+                'elevenlabs': bool(os.environ.get('ELEVENLABS_API_KEY', '').strip()),
+                'vapi': bool(os.environ.get('VAPI_API_KEY', '').strip()),
+            },
+            'audio_decoder_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe')),
+            'storage_available': shutil.disk_usage(store.root).free >= 256 * 1024 * 1024,
+            'provider_access_verified': False,
+        }
 
     @app.get('/api/me')
     def me(user=Depends(actor)):
@@ -564,6 +587,12 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
 
     @app.get('/')
     def index():
+        if os.environ.get('RANEEN_PLATFORM_HOME', '0').strip() == '1':
+            return RedirectResponse('/enroll', status_code=307)
+        return FileResponse(static / 'index.html')
+
+    @app.get('/studio', include_in_schema=False)
+    def legacy_studio():
         return FileResponse(static / 'index.html')
 
     return app

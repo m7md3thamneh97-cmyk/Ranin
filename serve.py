@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import uvicorn
 from studio.app import token_hash, now
 from studio.runtime import create_app
+from studio.release import backup_before_release
 
 OWNER_ID = 'deployment-owner'
 
@@ -115,6 +116,7 @@ def read_config(
 
 
 def make_app(root: Path, origin: str, token: str):
+    backup_before_release(root, os.environ.get('RENDER_GIT_COMMIT'))
     app = create_app(root, public_origin=origin, owner_only=True)
     # Only the managed owner's credential rotates. Never print or export it.
     app.state.store.execute(

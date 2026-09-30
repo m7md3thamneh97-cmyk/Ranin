@@ -26,6 +26,12 @@ jobs:
           node-version: "22"
       - name: Install Python dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: Install audio validation dependency
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes ffmpeg
+          fi
       - name: Python suite
         run: python -m pytest -q
       - name: PCM WAV encoder assertions

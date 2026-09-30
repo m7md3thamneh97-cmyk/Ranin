@@ -1,12 +1,20 @@
 """Voice enrollment Gate A tests. Providers and audio are synthetic/mocked."""
 import hashlib
 import os
+import subprocess
+from functools import lru_cache
 
 import pytest
 from fastapi.testclient import TestClient
 
 from studio.enrollment import ProviderError
 from studio.runtime import create_app
+
+
+@lru_cache(maxsize=32)
+def synthetic_audio(seq=0, fmt='webm', duration=15):
+    """Genuine locally synthesized tone fixtures; never real enrollment speech."""
+    return subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i',f'sine=frequency={240+seq*13}:sample_rate=16000:duration={duration}', '-c:a','libopus' if fmt=='webm' else 'libmp3lame','-b:a','20k' if fmt=='webm' else '64k','-f',fmt,'pipe:1'],check=True,capture_output=True).stdout
 
 
 def auth(user):
@@ -71,7 +79,7 @@ class FakeProviders:
         assert api_key == "test-eleven"
         assert voice_id == "voice_test_123456"
         self.speech_calls.append(text)
-        return b"ID3" + b"x" * 1500
+        return synthetic_audio(fmt="mp3",duration=1)
 
     async def vapi_delete_assistant(self, api_key, assistant_id):
         assert api_key == "test-vapi-private"
@@ -103,6 +111,7 @@ def env(tmp_path, monkeypatch):
     other = app.state.store.create_user("Other", "admin")
     fake = FakeProviders()
     app.state.enrollment_provider = fake
+    app.state.enrollment_sideband = FakeSideband()
     return TestClient(app), app, owner, other, fake
 
 
@@ -122,7 +131,7 @@ def start(c, owner):
 
 
 def upload(c, owner, sid, seq, duration=15000, payload=None):
-    data = payload if payload is not None else (("chunk-%d-" % seq).encode() + b"x" * 1200)
+    data = payload if payload is not None else synthetic_audio(seq=seq,duration=duration/1000)
     headers = auth(owner) | {
         "Content-Type": "audio/webm",
         "X-Speaker-Role": "contributor",
@@ -132,48 +141,44 @@ def upload(c, owner, sid, seq, duration=15000, payload=None):
     return c.put("/api/enrollment/sessions/%s/chunks/%d" % (sid, seq), headers=headers, content=data)
 
 
+class FakeSideband:
+    """Synthetic transport: no real network or provider events in route tests."""
+    async def attach(self, session_id, call_id, api_key):
+        pass
+
+    async def close(self, session_id, call_id=None):
+        pass
+
+    async def stop_all(self):
+        pass
+
+
 def confirm_pattern(c, owner, sid, suffix="1"):
-    first = "u-" + suffix
-    second = "c-" + suffix
-    evidence = "ev-" + suffix
-    assert c.post(
-        "/api/enrollment/sessions/%s/transcripts" % sid,
-        headers=auth(owner),
-        json={"item_id": first, "transcript": "لا، مليون ونص، مش مليونين."},
-    ).status_code == 200
-    r = c.post(
-        "/api/enrollment/sessions/%s/tool" % sid,
-        headers=auth(owner),
-        json={
-            "call_id": evidence,
-            "name": "propose_evidence",
-            "source_item_id": first,
-            "arguments": {
-                "kind": "decision_rule",
-                "situation": "The caller corrects a budget.",
-                "interpretation": "Acknowledge the corrected number before asking the next question.",
-                "change_condition": "If the amount is still ambiguous, confirm it first.",
-            },
-        },
-    )
-    assert r.status_code == 200, r.text
-    assert c.post(
-        "/api/enrollment/sessions/%s/transcripts" % sid,
-        headers=auth(owner),
-        json={"item_id": second, "transcript": "آه، بالضبط."},
-    ).status_code == 200
-    r = c.post(
-        "/api/enrollment/sessions/%s/tool" % sid,
-        headers=auth(owner),
-        json={
-            "call_id": "confirm-call-" + suffix,
-            "name": "confirm_evidence",
-            "source_item_id": second,
-            "arguments": {"evidence_id": evidence, "accepted": True, "correction": ""},
-        },
-    )
-    assert r.status_code == 200
-    return evidence
+    """Inject labeled synthetic PROVIDER evidence, never browser-authored text."""
+    from studio.app import now
+    from studio.enrollment_evidence import EvidenceService
+    store = c.app.state.store
+    evidence = EvidenceService(store)
+    call_id = "rtc_synthetic_evidence_" + suffix
+    store.execute("INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET call_id=excluded.call_id,state='open'", (sid, call_id, "open", now(), now()))
+    first, second = "synthetic-answer-" + suffix, "synthetic-approval-" + suffix
+    evidence.mark_audio(sid, call_id, first)
+    evidence.mark_audio(sid, call_id, first, committed=True)
+    evidence.record_transcript(sid, call_id, first, "لا، مليون ونص، مش مليونين.")
+    proposal = evidence.propose(sid, call_id, "synthetic-tool-" + suffix, {
+        "kind": "decision_rule", "situation": "The caller corrects a budget.",
+        "interpretation": "Acknowledge the corrected number before asking the next question.",
+        "change_condition": "If the amount is still ambiguous, confirm it first.",
+        "replaces_id": "",
+    })
+    assert proposal["ok"]
+    assert evidence.verify_readback(sid, call_id, proposal["challenge_nonce"], proposal["challenge_text"])
+    evidence.mark_audio(sid, call_id, second)
+    evidence.mark_audio(sid, call_id, second, committed=True)
+    result = evidence.record_transcript(sid, call_id, second, "Yes, save this.")
+    assert result["status"] == "confirmed"
+    store.execute("UPDATE enrollment_realtime_calls SET state='closed' WHERE session_id=? AND call_id=?", (sid, call_id))
+    return proposal["evidence_id"]
 
 
 def test_feature_default_off_and_owner_isolation(env, monkeypatch):
@@ -246,8 +251,8 @@ def test_clone_fresh_previews_and_vapi_assistant_reuse_voice(env, monkeypatch):
         assert upload(c, owner, sid, seq).status_code == 200
     confirm_pattern(c, owner, sid)
     behavior = c.post("/api/enrollment/sessions/%s/behavior" % sid, headers=auth(owner), json={"approve": True}).json()
-    clone = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True})
-    assert clone.status_code == 200 and clone.json()["state"] == "ready"
+    clone = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True,"final_seq":3})
+    assert clone.status_code == 200 and clone.json()["state"] == "sample_required"
     assert clone.json()["voice_version_id"]
     voice_version_id = clone.json()["voice_version_id"]
     version_row = app.state.store.one(
@@ -255,7 +260,7 @@ def test_clone_fresh_previews_and_vapi_assistant_reuse_voice(env, monkeypatch):
     )
     manifest = __import__("json").loads(version_row["sample_manifest"])
     assert version_row["provider_voice_id"] == "voice_test_123456"
-    assert version_row["state"] == "ready"
+    assert version_row["state"] == "sample_required"
     assert manifest["total_ms"] >= 60000
     assert [x["seq"] for x in manifest["chunks"]] == [0, 1, 2, 3]
     assert all(len(x["sha256"]) == 64 for x in manifest["chunks"])
@@ -268,6 +273,7 @@ def test_clone_fresh_previews_and_vapi_assistant_reuse_voice(env, monkeypatch):
         )
         assert preview.status_code == 200 and preview.content.startswith(b"ID3")
     assert len(fake.speech_calls) == 3
+    assert c.post(f"/api/enrollment/sessions/{sid}/voice-approval",headers=auth(owner),json={"approve":True}).status_code == 200
     assistant = c.post(
         "/api/enrollment/sessions/%s/assistant" % sid,
         headers=auth(owner),
@@ -278,12 +284,12 @@ def test_clone_fresh_previews_and_vapi_assistant_reuse_voice(env, monkeypatch):
     assert sent["voice"]["voiceId"] == "voice_test_123456"
     assert "tools" not in sent and "serverUrl" not in sent
     cfg = c.get("/api/enrollment/sessions/%s/preview-config" % sid, headers=auth(owner))
-    assert cfg.status_code == 200
-    assert cfg.json()["public_key"] == "test-vapi-public"
+    assert cfg.status_code == 410
+    assert "test-vapi-public" not in cfg.text
     confirm_pattern(c, owner, sid, "later")
     v2 = c.post("/api/enrollment/sessions/%s/behavior" % sid, headers=auth(owner), json={"approve": True}).json()
     assert v2["version"] == 2
-    reused = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True}).json()
+    reused = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True,"final_seq":3}).json()
     assert reused["reused"] is True
     assert reused["voice_version_id"] == voice_version_id
     assert fake.clone_calls == 1
@@ -299,9 +305,9 @@ def test_unknown_clone_outcome_blocks_duplicate_retry(env, monkeypatch):
     for seq in range(4):
         upload(c, owner, sid, seq)
     fake.clone_error = ProviderError("timeout", uncertain=True)
-    first = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True})
+    first = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True,"final_seq":3})
     assert first.status_code == 502
-    second = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True})
+    second = c.post("/api/enrollment/sessions/%s/clone" % sid, headers=auth(owner), json={"approve": True,"final_seq":3})
     assert second.status_code == 200 and second.json()["state"] == "outcome_unknown"
     assert fake.clone_calls == 1
 
@@ -331,9 +337,12 @@ def test_revocation_deletes_known_provider_artifacts_and_is_idempotent(env, monk
     clone = c.post(
         "/api/enrollment/sessions/%s/clone" % sid,
         headers=auth(owner),
-        json={"approve": True},
+        json={"approve": True,"final_seq":3},
     )
     assert clone.status_code == 200
+    for kind in ['question','number','correction']:
+        assert c.post(f'/api/enrollment/sessions/{sid}/preview',headers=auth(owner),json={'approve':True,'kind':kind}).status_code==200
+    assert c.post(f'/api/enrollment/sessions/{sid}/voice-approval',headers=auth(owner),json={'approve':True}).status_code==200
     assistant = c.post(
         "/api/enrollment/sessions/%s/assistant" % sid,
         headers=auth(owner),
