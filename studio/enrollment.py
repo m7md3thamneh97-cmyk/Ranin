@@ -628,12 +628,13 @@ def install(app):
             if active:
                 old_id = active['id']
                 prior = db.execute("SELECT detail FROM enrollment_operations WHERE session_id=? AND kind='realtime_call'", (old_id,)).fetchall()
-                exhausted = len(prior) >= 30 or sum(json.loads(item['detail']).get('consumed_seconds', 0) for item in prior) >= 1790
+                exhausted = len(prior) >= 30 or sum(json.loads(item['detail']).get('consumed_seconds', 0) for item in prior) > 1790
                 live = db.execute('SELECT state FROM enrollment_realtime_calls WHERE session_id=?', (old_id,)).fetchone()
                 unknown = db.execute("SELECT id FROM enrollment_operations WHERE session_id=? AND kind IN ('voice_clone','vapi_assistant') AND state IN ('dispatching','outcome_unknown') LIMIT 1", (old_id,)).fetchone()
+                preview = db.execute("SELECT state FROM enrollment_preview_calls WHERE session_id=? AND state IN ('open','dispatching','close_unknown','outcome_unknown') LIMIT 1", (old_id,)).fetchone()
                 # A new explicit consent submission can start another interview
                 # after a spent allowance. Preserve the prior saved session.
-                if exhausted and not unknown and (not live or live['state'] in {'closed','failed'}):
+                if exhausted and not unknown and not preview and (not live or live['state'] in {'closed','failed'}):
                     active = None
             ident = active["id"] if active else uid()
             if not active:

@@ -262,3 +262,42 @@ def test_exhausted_closed_interview_with_unknown_provider_operation_is_reused(en
     assert response.json() == {'id': old_sid, 'resumed': True}
     assert app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (old_sid,)) == before
     assert app.state.store.one('SELECT COUNT(*) AS n FROM enrollment_sessions WHERE owner_id=?', (owner['id'],))['n'] == 1
+
+
+@pytest.mark.parametrize('preview_state', ['open', 'dispatching', 'close_unknown', 'outcome_unknown'])
+def test_exhausted_closed_interview_with_unresolved_preview_is_reused(env, monkeypatch, preview_state):
+    client, app, owner, _, _ = env
+    enable(monkeypatch)
+    old_sid = start(client, owner)
+    app.state.store.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)',
+                            (uid(), old_sid, 'realtime_call', 'exhausted-completed-call', 'succeeded',
+                             'rtc_exhausted_closed', json.dumps({'consumed_seconds': 1800}), now(), now()))
+    app.state.store.execute('INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?)',
+                            (old_sid, 'rtc_exhausted_closed', 'closed', now(), now()))
+    app.state.store.execute('INSERT INTO enrollment_preview_calls VALUES(?,?,?,?,?,?,?,?)',
+                            (uid(), old_sid, 'synthetic-assistant', preview_state,
+                             'synthetic-preview-call', None, now(), now()))
+
+    response = explicitly_consented_start(client, owner)
+    assert response.status_code == 201
+    assert response.json() == {'id': old_sid, 'resumed': True}
+    assert app.state.store.one('SELECT COUNT(*) AS n FROM enrollment_sessions WHERE owner_id=?', (owner['id'],))['n'] == 1
+
+
+def test_exactly_ten_interview_seconds_remaining_reuses_existing_session(env, monkeypatch):
+    client, app, owner, _, _ = env
+    enable(monkeypatch)
+    old_sid = start(client, owner)
+    app.state.store.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)',
+                            (uid(), old_sid, 'realtime_call', 'almost-completed-call', 'succeeded',
+                             'rtc_almost_completed', json.dumps({'consumed_seconds': 1790}), now(), now()))
+    app.state.store.execute('INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?)',
+                            (old_sid, 'rtc_almost_completed', 'closed', now(), now()))
+
+    response = explicitly_consented_start(client, owner)
+    assert response.status_code == 201
+    assert response.json() == {'id': old_sid, 'resumed': True}
+    assert app.state.store.one('SELECT COUNT(*) AS n FROM enrollment_sessions WHERE owner_id=?', (owner['id'],))['n'] == 1
+    journey = client.get(f'/api/enrollment/sessions/{old_sid}/journey', headers=auth(owner)).json()
+    assert journey['interview_seconds_left'] == 10
+    assert journey['resume_limit'] is None and journey['can_resume'] is True
