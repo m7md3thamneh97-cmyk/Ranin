@@ -1,6 +1,6 @@
 """Nonsecret deployment diagnostics and owner landing navigation."""
 from fastapi.testclient import TestClient
-from studio.app import create_app
+from studio.runtime import create_app
 from studio.release import backup_before_release
 import sqlite3
 
@@ -40,6 +40,15 @@ def test_platform_home_retains_legacy_studio(tmp_path, monkeypatch):
         assert response.status_code == 307
         assert response.headers['location'] == '/enroll'
         assert client.get('/studio').status_code == 200
+
+
+def test_platform_home_off_preserves_guided_teaching(tmp_path, monkeypatch):
+    monkeypatch.setenv('RANEEN_PLATFORM_HOME', '0')
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.get('/', follow_redirects=False)
+        assert response.status_code == 200
+        assert '/static/guided.js' in response.text
+        assert 'location' not in response.headers
 
 
 def test_release_backup_preserves_original_and_is_not_overwritten(tmp_path):
