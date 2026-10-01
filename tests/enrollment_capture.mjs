@@ -503,6 +503,95 @@ test('a delayed old final event after acknowledged loss cannot replace the resum
   assert.equal(await finalPause, true);
 });
 
+test('a recovered late final stays pending until saved, then permits resume', async t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  class DelayedRecorder extends FakeRecorder {
+    stop() { this.state = 'inactive'; }
+    deliverFinal() { this.ondataavailable?.({data: this.payload}); this.onstop?.(); }
+  }
+  const saved = deferred();
+  const {capture} = harness({Recorder: DelayedRecorder, segmentMs: 60000,
+    upload: async item => { await saved.promise; return {seq: item.seq}; }});
+  await capture.start();
+  const recorder = capture.recorder;
+  const paused = capture.pause();
+  t.mock.timers.tick(3001);
+  assert.equal(await paused, false);
+  assert.equal(capture.uncertainTail, true);
+  await assert.rejects(capture.start(), /save_audio_first/);
+
+  recorder.deliverFinal();
+  assert.equal(capture.hasPending, true, 'recovered bytes still need an upload acknowledgement');
+  await assert.rejects(capture.start(), /save_audio_first/);
+  saved.resolve();
+  await capture.queue.flush();
+  assert.equal(capture.uncertainTail, false, 'the recovered final event resolves its missing-output warning');
+  assert.equal(capture.hasPending, false);
+  assert.equal(await capture.start(), true, 'no missing-audio acknowledgement is needed after complete recovery');
+  const resumedRecorder = capture.recorder;
+  const finalPause = capture.pause();
+  resumedRecorder.deliverFinal();
+  assert.equal(await finalPause, true);
+});
+
+test('a real recorder error remains unresolved after its delayed final bytes arrive and save', async t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  class DelayedRecorder extends FakeRecorder {
+    stop() { this.state = 'inactive'; }
+    deliverFinal() { this.ondataavailable?.({data: this.payload}); this.onstop?.(); }
+  }
+  const {capture} = harness({Recorder: DelayedRecorder, segmentMs: 60000});
+  await capture.start();
+  const recorder = capture.recorder;
+  recorder.onerror();
+  const paused = capture.pausing;
+  t.mock.timers.tick(3001);
+  assert.equal(await paused, false);
+  recorder.deliverFinal();
+  await capture.queue.flush();
+
+  assert.equal(capture.queue.hasPending, false);
+  assert.equal(capture.uncertainTail, true, 'late bytes do not prove a failed recorder captured everything');
+  assert.equal(capture.hasPending, true);
+  await assert.rejects(capture.start(), /save_audio_first/);
+  assert.equal(capture.acknowledgeMissingTail(), true, 'a genuine recording loss still requires acknowledgement');
+  assert.equal(capture.hasPending, false);
+});
+
+test('an old recovered final cannot clear a different recorder final that is still missing', async t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  class DelayedRecorder extends FakeRecorder {
+    stop() { this.state = 'inactive'; }
+    deliverFinal() { this.ondataavailable?.({data: this.payload}); this.onstop?.(); }
+  }
+  const {capture} = harness({Recorder: DelayedRecorder, segmentMs: 60000});
+  await capture.start();
+  const oldRecorder = capture.recorder;
+  const firstPause = capture.pause();
+  t.mock.timers.tick(3001);
+  assert.equal(await firstPause, false);
+  assert.equal(capture.acknowledgeMissingTail(), true);
+  await capture.start();
+  const currentRecorder = capture.recorder;
+  const secondPause = capture.pause();
+  t.mock.timers.tick(3001);
+  assert.equal(await secondPause, false);
+
+  oldRecorder.deliverFinal();
+  await capture.queue.flush();
+  assert.equal(capture.queue.hasPending, false);
+  assert.equal(capture.uncertainTail, true, 'recovering old audio cannot acknowledge a later recording loss');
+  await assert.rejects(capture.start(), /save_audio_first/);
+  currentRecorder.deliverFinal();
+  await capture.queue.flush();
+  assert.equal(capture.hasPending, false);
+  assert.equal(await capture.start(), true);
+  const resumedRecorder = capture.recorder;
+  const finalPause = capture.pause();
+  resumedRecorder.deliverFinal();
+  assert.equal(await finalPause, true);
+});
+
 test('a throwing Recorder.stop cannot prevent immediate microphone and peer release', async () => {
   class ThrowingStopRecorder extends FakeRecorder {
     stop() { throw Error('synthetic recorder stop failure'); }

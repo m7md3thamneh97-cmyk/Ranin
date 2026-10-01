@@ -45,7 +45,7 @@ CONSENT_TEXT = (
     "not me. This permission does not authorize public/commercial impersonation or "
     "customer calls. I can revoke local use; provider cleanup may remain pending."
 )
-CHUNK_MAX = 80 * 1024
+CHUNK_MAX = 256 * 1024
 SESSION_MAX = 220 * 1024 * 1024
 MIN_CLONE_MS = 60_000
 MAX_CLONE_MS = 125_000
@@ -299,6 +299,10 @@ class Providers:
                 )
         except httpx.HTTPError as exc:
             raise ProviderError("OpenAI Realtime hangup failed.", uncertain=True) from exc
+        # Hanging up a known call is idempotent. A remotely ended call may no
+        # longer exist; do not strand its saved interview behind close_unknown.
+        if r.status_code in {404, 410}:
+            return
         if r.status_code >= 300:
             raise ProviderError(f"OpenAI Realtime hangup returned HTTP {r.status_code}.", uncertain=True)
 
@@ -621,6 +625,17 @@ def install(app):
                 "AND state NOT IN ('complete','failed') ORDER BY created DESC LIMIT 1",
                 (user["id"],),
             ).fetchone()
+            if active:
+                old_id = active['id']
+                prior = db.execute("SELECT detail FROM enrollment_operations WHERE session_id=? AND kind='realtime_call'", (old_id,)).fetchall()
+                exhausted = len(prior) >= 30 or sum(json.loads(item['detail']).get('consumed_seconds', 0) for item in prior) > 1790
+                live = db.execute('SELECT state FROM enrollment_realtime_calls WHERE session_id=?', (old_id,)).fetchone()
+                unknown = db.execute("SELECT id FROM enrollment_operations WHERE session_id=? AND kind IN ('voice_clone','vapi_assistant') AND state IN ('dispatching','outcome_unknown') LIMIT 1", (old_id,)).fetchone()
+                preview = db.execute("SELECT state FROM enrollment_preview_calls WHERE session_id=? AND state IN ('open','dispatching','close_unknown','outcome_unknown') LIMIT 1", (old_id,)).fetchone()
+                # A new explicit consent submission can start another interview
+                # after a spent allowance. Preserve the prior saved session.
+                if exhausted and not unknown and not preview and (not live or live['state'] in {'closed','failed'}):
+                    active = None
             ident = active["id"] if active else uid()
             if not active:
                 db.execute(
@@ -663,11 +678,18 @@ def install(app):
         )
         live = store.one("SELECT state FROM enrollment_realtime_calls WHERE session_id=?", (ident,))
         provider_pending = bool(pending or (live and live["state"] in {"close_unknown","dispatching","outcome_unknown"}))
-        return journey_summary(
+        result = journey_summary(
             row, enabled=_enabled(), provider_pending=provider_pending,
             cleanup_state=cleanup_summary(ident) if row["revoked_at"] else "not_revoked",
             interview_call_state=live["state"] if live else "none",
         )
+        calls = store.all("SELECT detail FROM enrollment_operations WHERE session_id=? AND kind='realtime_call'", (ident,))
+        result['interview_attempts_left'] = max(0, 30 - len(calls))
+        result['interview_seconds_left'] = max(0, 1800 - sum(json.loads(call['detail']).get('consumed_seconds', 0) for call in calls))
+        result['resume_limit'] = 'connections' if not result['interview_attempts_left'] else 'time' if result['interview_seconds_left'] < 10 else None
+        if result['resume_limit']:
+            result['can_resume'] = False
+        return result
 
     @app.get("/api/enrollment/sessions/{ident}")
     def get_session(ident: str, user=Depends(admin)):
@@ -796,7 +818,7 @@ def install(app):
 You are the Raneen voice-enrollment interviewer. The speaker is teaching an AI how
 they naturally speak and handle customer situations. Converse naturally in the
 speaker's own language/dialect; do not force Emirati Arabic or formal Arabic.
-Your target session is 20-30 minutes, but adapt to the person.
+Aim for a first preview after about five minutes, then let the person keep teaching.
 
 Alternate between natural conversation, realistic customer role-play, asking what
 mattered in a response, and changing one important fact to learn when their answer
@@ -953,7 +975,7 @@ training and do not claim to be the contributor. Session id: {ident}
             if current and current['state'] in {'open','dispatching','close_unknown','outcome_unknown'}:
                 raise HTTPException(409,'An interview is active or its previous outcome needs reconciliation.')
             attempts = db.execute("SELECT COUNT(*) AS n FROM enrollment_operations WHERE session_id=? AND kind='realtime_call'",(ident,)).fetchone()['n']
-            if attempts >= 12: raise HTTPException(429,'The private interview connection allowance is used.')
+            if attempts >= 30: raise HTTPException(429,'The private interview connection allowance is used.')
             previous = db.execute("SELECT detail FROM enrollment_operations WHERE session_id=? AND kind='realtime_call'",(ident,)).fetchall()
             used_seconds = sum(json.loads(x['detail']).get('consumed_seconds',0) for x in previous)
             maximum = max(0,1800-used_seconds)

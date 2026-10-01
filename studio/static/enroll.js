@@ -3,10 +3,10 @@ import {copy} from './enrollment-copy.js';
 // Retire the earlier enrollment credential cache. This flow keeps access in memory.
 try { sessionStorage.removeItem('raneen-token'); } catch {}
 const q=(s)=>document.querySelector(s), app=q('#app');
-const S={lang:'ar',token:'',page:'login',sessions:[],session:null,journey:null,capture:null,transcript:'',lastItem:null,micEpoch:0,eventChain:Promise.resolve(),workflow:null,busy:false,phase:'',samples:{},listened:new Set(),correction:false,call:null,callNonce:'',callState:'idle',workflowEpoch:0};
+const S={lang:'ar',token:'',page:'login',sessions:[],session:null,journey:null,capture:null,transcript:'',lastItem:null,micEpoch:0,eventChain:Promise.resolve(),workflow:null,busy:false,phase:'',samples:{},listened:new Set(),correction:false,call:null,callNonce:'',callState:'idle',workflowEpoch:0,resuming:false,refreshSeq:0};
 try { if(localStorage.getItem('raneen-language')==='en') S.lang='en'; } catch {}
 const remote=new Audio(); remote.autoplay=true;
-const t=(key)=>copy[S.lang][key]||key;
+const t=(key)=>copy[S.lang][key]??key;
 const esc=(v)=>String(v??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=(ms)=>{const s=Math.floor((ms||0)/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');};
 function notice(message,error=false){const n=q('#notice');n.textContent=message;n.className='show'+(error?' error-notice':'');clearTimeout(notice.timer);notice.timer=setTimeout(()=>n.className='',9000);}
@@ -40,7 +40,7 @@ function shell(content,withSteps=false){
   bind('#signout',signout);
   q('.brand').onclick=(e)=>{e.preventDefault();if(!S.token)login();else leave().then((ok)=>ok&&home()).catch(report);};
 }
-function hero(title,text,eyebrow=''){return `<section class="welcome"><p class="eyebrow">${eyebrow}</p><h1>${title}</h1><p class="lead">${text}</p></section>`;}
+function hero(title,text,eyebrow=''){return `<section class="welcome">${eyebrow?`<p class="eyebrow">${eyebrow}</p>`:''}<h1>${title}</h1>${text?`<p class="lead">${text}</p>`:''}</section>`;}
 function render(){({login,home:renderHome,consent:renderConsent,microphone:renderMic,interview:renderInterview,prepare:renderPrepare,agent:renderAgent}[S.page]||login)();}
 function login(error=''){
   S.page='login';shell(hero(t('welcome'),t('intro'))+`<div class="journey-cards login-journey">${[['talk','talkText'],['prepare','prepareText'],['test','testText']].map(([title,txt],i)=>`<div><span>0${i+1}</span><h3>${t(title)}</h3><p>${t(txt)}</p></div>`).join('')}</div><form id="loginForm" class="card login-card"><h2>${t('access')}</h2><p>${t('accessText')}</p>${error?`<p class="error" role="alert">${esc(error)}</p>`:''}<label for="token">${t('code')}</label><input id="token" type="password" required autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="codeNote"><p id="codeNote" class="small muted">${t('codeNote')}</p><button class="primary" id="login" type="submit">${t('continue')}</button></form>`);
@@ -93,7 +93,7 @@ function createCapture(){
   const id=S.session,base='/api/enrollment/sessions/'+encodeURIComponent(id);
   S.capture=new InterviewCapture({sessionId:id,nextSeq:S.journey.next_seq,
     upload:(item,signal)=>request(base+'/chunks/'+item.seq,{method:'PUT',signal,body:item.blob,headers:{'Content-Type':item.blob.type||'audio/webm','X-Speaker-Role':'contributor','X-Chunk-Sha256':item.checksum,'X-Duration-Ms':String(item.durationMs)}}),
-    openConnection:(sdp)=>request(base+'/webrtc',{method:'POST',body:sdp,headers:{'Content-Type':'application/sdp'},text:true,timeout:35000}),
+    openConnection:(sdp)=>request(base+'/webrtc',{method:'POST',body:sdp,headers:{'Content-Type':'application/sdp'},text:true,timeout:60000}),
     closeConnection:async()=>{const r=await post(base+'/webrtc-close');if(S.session===id)await refresh();return r;},
     onState:update,onError:report,onAck:()=>{if(S.session===id)refresh().catch(()=>{});},
     onRemote:(stream)=>{remote.srcObject=stream;if(stream)remote.play().catch(()=>notice(t('blockedAudio'),true));},
@@ -102,56 +102,83 @@ function createCapture(){
 }
 function renderInterview(){
   S.page='interview';const j=S.journey;
-  shell(hero(j.revoked?t('revokedTitle'):t(S.correction?'correctionTitle':'interviewTitle'),j.revoked?t('revokedText'):t(S.correction?'correctionIntro':'interviewIntro'),t('privateInterview'))+`<section class="card interview-card"><div class="interview-top"><span id="connectionStatus" class="pill" role="status">${t('off')}</span><span class="small muted">${t('target')}</span></div><div id="orb" class="orb" aria-hidden="true">ر</div><h2 id="interviewHint">${t('ready')}</h2><p id="interviewSupport">${t('reassurance')}</p><div class="saved-progress"><strong id="savedMinutes" dir="ltr">${fmt(j.saved_audio_ms)}</strong><span>${t('saved')}</span></div><p class="small muted">${t('durationNote')}</p><div id="uploadState" class="save-state" role="status"></div><p id="serverState" class="status-note" hidden></p><div class="actions"><button id="connect" class="primary">${t('start')}</button><button id="pause" class="secondary" hidden>${t('pause')}</button><button id="retryUploads" class="primary" hidden>${t('retry')}</button><button id="ackTail" class="secondary" hidden>${t('acknowledgeTail')}</button><button id="endPrevious" class="secondary" hidden>${t('endPrevious')}</button><button id="micCheck" class="text-button">${t('checkSound')}</button></div><p class="small muted">${t('headphones')}</p></section><details class="card"><summary>${t('details')}</summary><h3>${t('latest')}</h3><div id="transcript" class="transcript" dir="auto">${esc(S.transcript||t('emptyTranscript'))}</div><p class="small muted">${t('transcriptNote')}</p><p>${t('patterns')}: <strong id="patterns">${j.confirmed_patterns||0}</strong></p><button id="refresh" class="secondary">${t('refresh')}</button></details><section class="card next-stage"><div class="next-icon" aria-hidden="true">2</div><div><h2>${t('nextTitle')}</h2><p>${t('nextText')}</p>${!j.revoked?`<button id="finish" class="primary">${t(S.correction?'updateAgent':'finish')}</button>`:''}</div></section><div class="bottom-actions"><button id="backHome" class="text-button">${t('backHome')}</button>${j.revoked?`<button id="cleanup" class="secondary">${t('cleanup')}</button>`:`<button id="revoke" class="text-button danger">${t('revoke')}</button>`}</div>${j.revoked?`<p class="small muted">${t('cleanupNote')}</p>`:''}`,true);
-  bind('#finish',finishInterview);
-  bind('#connect',async()=>{try{if(S.journey.can_resume&&!S.busy)await S.capture.start();}finally{update();}});
+  shell(hero(j.revoked?t('revokedTitle'):t(S.correction?'correctionTitle':'interviewTitle'),j.revoked?t('revokedText'):t(S.correction?'correctionIntro':'interviewIntro'))+`<section class="card interview-card"><div class="interview-top"><span id="connectionStatus" class="pill" role="status">${t('off')}</span><span id="savedMinutes" class="small" dir="ltr">${fmt(j.saved_audio_ms)}</span></div><div id="orb" class="orb" aria-hidden="true">ر</div><h2 id="interviewHint">${t('ready')}</h2><p id="interviewSupport">${t('reassurance')}</p><div id="uploadState" class="save-state" role="status"></div><p id="serverState" class="status-note" hidden></p><div class="actions"><button id="connect" class="primary">${t('start')}</button><button id="newInterview" class="primary" hidden>${t('newInterview')}</button><button id="pause" class="secondary" hidden>${t('pause')}</button><button id="finish" class="secondary">${t(S.correction?'updateAgent':'finish')}</button></div><p class="small muted">${t('target')}</p></section><details class="card"><summary>${t('details')}</summary><p>${t('headphones')}</p><p class="small muted">${t('durationNote')}</p><button id="retryUploads" class="secondary" hidden>${t('retry')}</button><button id="ackTail" class="secondary" hidden>${t('acknowledgeTail')}</button><button id="endPrevious" class="secondary" hidden>${t('endPrevious')}</button><button id="micCheck" class="text-button">${t('checkSound')}</button><h3>${t('latest')}</h3><div id="transcript" class="transcript" dir="auto">${esc(S.transcript||t('emptyTranscript'))}</div><p>${t('patterns')}: <strong id="patterns">${j.confirmed_patterns||0}</strong></p><button id="refresh" class="text-button">${t('refresh')}</button></details><div class="bottom-actions"><button id="backHome" class="text-button">${t('backHome')}</button>${j.revoked?`<button id="cleanup" class="secondary">${t('cleanup')}</button>`:`<button id="revoke" class="text-button danger">${t('revoke')}</button>`}</div>${j.revoked?`<p class="small muted">${t('cleanupNote')}</p>`:''}`,true);
+  bind('#finish',finishInterview);bind('#connect',resumeInterview);bind('#newInterview',async()=>{if(S.resuming||S.busy)return;S.resuming=true;update();try{if(await settleInterview()){if(S.journey.provider_pending)notice(t('outcomePending'),true);else await consent();}}finally{S.resuming=false;update();}});
   bind('#pause',async()=>{await S.capture.pause();await refresh();});
   bind('#retryUploads',async()=>{const ok=await S.capture.retry();notice(ok?t('allSaved'):t('saveFailed'),!ok);await refresh();});
   bind('#ackTail',()=>{if(confirm(t('acknowledgeConfirm')))S.capture.acknowledgeMissingTail();});
-  bind('#endPrevious',async()=>{q('#endPrevious').disabled=true;try{await post(path('/webrtc-close'));await refresh();}finally{if(q('#endPrevious'))q('#endPrevious').disabled=false;}});
+  bind('#endPrevious',async()=>{await post(path('/webrtc-close'),{},{timeout:30000});await refresh();});
   bind('#micCheck',async()=>{if(await leave()){S.page='microphone';renderMic();}});
   bind('#refresh',refresh);bind('#backHome',async()=>{if(await leave())await home();});bind('#revoke',revoke);
   bind('#cleanup',async()=>{await post(path('/cleanup'));notice(t('cleanupNote'));await refresh();});update();
+}
+// One contributor action settles saved bytes and a known previous call before
+// opening another. Uncertain provider creation and unavailable audio stay explicit.
+async function settleInterview(){
+  const c=S.capture,id=S.session,epoch=S.workflowEpoch,page=S.page,token=S.token,same=()=>S.capture===c&&S.session===id&&S.workflowEpoch===epoch&&S.page===page&&S.token===token&&!S.busy&&!S.journey.revoked;
+  if(!c||S.busy||S.call||!same())return false;
+  if(c.stream||c.starting)await c.pause();else if(c.pausing)await c.pausing;
+  if(!same())return false;
+  if(c.queue.hasPending||c.unsavedFinal)await c.retry();
+  if(!same())return false;
+  if(c.queue.hasPending||c.unsavedFinal){notice(t('saveFailed'),true);return false;}
+  if(c.uncertainTail){if(!confirm(t('acknowledgeConfirm')))return false;c.acknowledgeMissingTail();}
+  await refresh();if(!same())return false;
+  if(['open','close_unknown'].includes(S.journey.interview_call_state)){
+    await post('/api/enrollment/sessions/'+encodeURIComponent(id)+'/webrtc-close',{},{timeout:30000});
+    await refresh();if(!same())return false;
+  }
+  if(['dispatching','outcome_unknown'].includes(S.journey.interview_call_state)){notice(t('outcomePending'),true);return false;}
+  return !c.hasPending;
+}
+async function resumeInterview(){
+  if(S.resuming||S.busy)return;S.resuming=true;update();
+  try{
+    if(!await settleInterview())return;
+    if(!S.journey.can_resume){notice(t(S.journey.resume_limit?'interviewLimit':'reviewNeeded'),true);return;}
+    await S.capture.start();
+  }finally{S.resuming=false;update();}
 }
 function update(){
   if(S.page!=='interview'||!S.capture||!q('#connect'))return;
   const c=S.capture,j=S.journey,live=c.state==='live',connecting=c.state==='connecting',pending=c.hasPending;
   const previous=!live&&!connecting&&['open','close_unknown'].includes(j.interview_call_state);
   const missingOnly=c.uncertainTail&&!c.queue.hasPending&&!c.unsavedFinal&&!c.pausing;
-  const oversize=c.queue.items.some((x)=>x.blob.size>80*1024)||c.unsavedFinal?.blob.size>80*1024;
+  const oversize=c.queue.items.some((x)=>x.blob.size>256*1024)||c.unsavedFinal?.blob.size>256*1024;
   q('#connectionStatus').textContent=t(j.revoked?'revoked':live?'active':connecting?'connecting':'off');q('#orb').classList.toggle('live',live);
   q('#interviewHint').textContent=t(j.revoked?'revoked':live?'listening':connecting?'connectingHint':pending?'saving':j.can_resume?'ready':'off');
   q('#interviewSupport').textContent=t(live?'liveNote':connecting?'permissionWait':'reassurance');
-  q('#connect').hidden=live||connecting||pending||previous||j.revoked;q('#connect').disabled=!j.can_resume||Boolean(c.starting||c.pausing);q('#connect').textContent=t(j.chunk_count?'resumeTalk':'start');
+  q('#newInterview').hidden=!j.resume_limit||live||connecting||j.revoked;q('#newInterview').disabled=!j.enabled||S.resuming||S.busy;
+  q('#connect').hidden=live||connecting||j.revoked||Boolean(j.resume_limit);q('#connect').disabled=!j.enabled||S.busy||S.resuming||Boolean(c.starting)||Boolean(j.resume_limit)||(!j.can_resume&&!previous&&!pending);q('#connect').textContent=t(j.chunk_count?'resumeTalk':'start');
   q('#pause').hidden=!(live||connecting);q('#pause').textContent=t(connecting?'cancel':'pause');
   q('#retryUploads').hidden=!pending||live||connecting||j.revoked||missingOnly||oversize;q('#retryUploads').disabled=Boolean(c.queue.running||c.pausing);
   q('#ackTail').hidden=!missingOnly||j.revoked;q('#endPrevious').hidden=!previous;
   q('#micCheck').disabled=live||connecting||pending||j.revoked;
-  if(q('#finish'))q('#finish').disabled=!j.enabled||!j.chunk_count||pending||connecting||Boolean(c.pausing);
+  if(q('#finish'))q('#finish').disabled=!j.enabled||(!j.chunk_count&&!c.queue.hasPending)||connecting||S.busy||S.resuming||j.revoked;
   if(S.workflow?.config&&!S.workflow.config.interview){q('#connect').disabled=true;q('#interviewSupport').textContent=t('notConfigured');}
   q('#uploadState').textContent=j.revoked?t('revokedText'):oversize?t('tooLarge'):missingOnly?t('lostTail'):c.uncertainTail||c.unsavedFinal?t('tailUnknown'):pending?`${t('waiting')} ${c.queue.items.length}. ${t('keepOpen')}`:j.chunk_count?t('allSaved'):t('noAudio');
   q('#uploadState').classList.toggle('unsaved',pending);
-  const key=previous?(j.interview_call_state==='close_unknown'?'closeUnknown':'previousOpen'):j.revoked&&['manual_reconciliation','pending'].includes(j.cleanup_state)?'cleanupNote':j.revoked?'':!j.enabled?'disabled':!j.can_resume&&!live&&!connecting?'reviewNeeded':'';
+  const key=previous?(j.interview_call_state==='close_unknown'?'closeUnknown':'previousOpen'):j.revoked&&['manual_reconciliation','pending'].includes(j.cleanup_state)?'cleanupNote':j.revoked?'':!j.enabled?'disabled':j.resume_limit&&!live&&!connecting?'interviewLimit':!j.can_resume&&!live&&!connecting?'reviewNeeded':'';
   q('#serverState').hidden=!key;q('#serverState').textContent=key?t(key):'';
 }
 async function refresh(){
-  const id=S.session;if(!id)return;const j=await request(path('/journey'));if(id!==S.session)return;
+  const id=S.session;if(!id)return;const seq=++S.refreshSeq,j=await request(path('/journey'));if(id!==S.session||seq!==S.refreshSeq)return;
   S.journey=j;S.capture?.queue.syncNextSeq(j.next_seq);
-  if(S.page!=='interview'){const workflow=await request('/api/enrollment/sessions/'+encodeURIComponent(id)+'/workflow');if(id!==S.session)return;S.workflow=workflow;if(j.revoked){++S.workflowEpoch;S.busy=false;stopPreviewLocal();S.call=null;clearSamples();S.page='interview';renderInterview();return;}}
+  if(S.page!=='interview'){const workflow=await request('/api/enrollment/sessions/'+encodeURIComponent(id)+'/workflow');if(id!==S.session||seq!==S.refreshSeq)return;S.workflow=workflow;if(j.revoked){++S.workflowEpoch;S.busy=false;stopPreviewLocal();S.call=null;clearSamples();S.page='interview';renderInterview();return;}}
   if(j.revoked&&(S.capture?.stream||S.capture?.starting))S.capture.pause({save:false}).catch(report);
   if(q('#savedMinutes'))q('#savedMinutes').textContent=fmt(j.saved_audio_ms);if(q('#patterns'))q('#patterns').textContent=j.confirmed_patterns||0;update();
 }
 async function realtime(event,capture){
   if(capture!==S.capture||S.journey?.revoked)return;
   const base='/api/enrollment/sessions/'+encodeURIComponent(capture.sessionId);
-  if(event.type==='raneen.connected')capture.send({type:'response.create',response:{instructions:(S.correction?'The contributor has just tested their private personalized AI agent and wants to teach a correction. Ask what it said, what they would say instead, and why. Preserve the existing approved voice. Confirm the corrected response pattern aloud and record confirmed evidence. ':'')+'Introduce yourself briefly as Raneen’s private AI interviewer. Ask in Arabic which language and dialect the contributor prefers, respect their spoken choice, and ask one natural question at a time. Do not claim a finished clone.'}});
+  if(event.type==='raneen.connected')capture.send({type:'response.create',response:{instructions:(S.correction?'The contributor has just tested their private personalized AI agent and wants to teach a correction. Ask what it said, what they would say instead, and why. Preserve the existing approved voice. Confirm the corrected response pattern aloud and record confirmed evidence. ':'')+(S.journey.chunk_count?'Welcome the contributor back briefly and continue from their previously confirmed examples. Avoid repeating introductions or setup instructions. Ask one natural question at a time. Do not claim a finished clone.':'Introduce yourself briefly as Raneen’s private AI interviewer. Ask in Arabic which language and dialect the contributor prefers, respect their spoken choice, and ask one natural question at a time. Do not claim a finished clone.')}});
   else if(event.type==='conversation.item.input_audio_transcription.completed'){
     // Provider sideband owns durable transcription and confirmation.
     if(capture!==S.capture||S.journey?.revoked)return;
     capture.lastItem=event.item_id;S.transcript=event.transcript||'';if(q('#transcript'))q('#transcript').textContent=S.transcript;
   }else if(event.type==='error')notice(t('interviewerError'),true);
 }
-async function leave(){if(S.busy){notice(t('preparingBackground'),true);return false;}if(S.call){notice(t('callAway'),true);return false;}stopSamples();stopMic();const capture=S.capture;if(capture)await capture.pause();if(capture!==S.capture)return false;if(capture?.hasPending){notice(t('keepOpen'),true);return false;}return true;}
+async function leave(){if(S.resuming){notice(t('saving'));return false;}if(S.busy){notice(t('preparingBackground'),true);return false;}if(S.call){notice(t('callAway'),true);return false;}stopSamples();stopMic();const capture=S.capture;if(capture)await capture.pause();if(capture!==S.capture)return false;if(capture?.hasPending){notice(t('keepOpen'),true);return false;}return true;}
 async function revoke(){
   if(!confirm(t('revokeConfirm')))return;const id=S.session,capture=S.capture;++S.workflowEpoch;S.busy=true;stopMic();stopPreviewLocal();clearSamples();capture?.pause({save:false}).catch(report);q('#revoke').disabled=true;
   try{await post('/api/enrollment/sessions/'+encodeURIComponent(id)+'/revoke',{confirm:true});if(S.session!==id||S.capture!==capture)return;S.call=null;S.capture=null;S.busy=false;await openSession(id);notice(t('revokedText'));}catch(e){S.busy=false;if(S.session===id&&q('#revoke'))q('#revoke').disabled=false;report(e);}
@@ -170,7 +197,7 @@ function workflowMessage(w){
   if(w.voice_state==='verification_required')return t('verificationPending');
   if(w.stage==='blocked'||w.operations?.some((o)=>['outcome_unknown','dispatching'].includes(o.state)))return t('outcomePending');
   if(!S.journey.enabled)return t('processingPaused');
-  if(w.config&&(!w.config.voice||!w.config.agent))return t('configurationNote');
+  if(w.config&&(!w.config.voice||(w.voice_approved&&!w.config.agent)))return t('configurationNote');
   return '';
 }
 async function fetchWorkflow(){const id=S.session;const w=await request('/api/enrollment/sessions/'+encodeURIComponent(id)+'/workflow');if(id!==S.session)return null;S.workflow=w;return w;}
@@ -185,18 +212,25 @@ function workflowFailure(e){
   return explain(e);
 }
 async function finishInterview(){
-  if(S.busy)return;if(!await leave())return;await refresh();
-  if(S.capture?.hasPending){notice(t('saveFirst'),true);return;}
-  if(S.journey.revoked)return;
-  if(!S.journey.chunk_count){notice(t('noSpeechSaved'),true);return;}
-  await fetchWorkflow();S.workflowError='';S.page='prepare';renderPrepare();
+  if(S.busy||S.resuming)return;
+  const id=S.session,epoch=S.workflowEpoch,capture=S.capture;
+  S.resuming=true;update();
+  try{
+    if(!await settleInterview())return;
+    if(S.capture?.hasPending){notice(t('saveFirst'),true);return;}
+    if(S.journey.revoked)return;
+    if(!S.journey.chunk_count){notice(t('noSpeechSaved'),true);return;}
+    await fetchWorkflow();
+    if(S.session!==id||S.capture!==capture||S.workflowEpoch!==epoch||S.journey.revoked||S.busy)return;
+    S.workflowError='';S.page='prepare';renderPrepare();await prepareAgent();
+  }finally{S.resuming=false;update();}
 }
 function renderPrepare(){
   S.page='prepare';const w=S.workflow||{},blocked=w.stage==='blocked'||w.voice_state==='verification_required'||w.operations?.some((o)=>['outcome_unknown','dispatching'].includes(o.state));
   const samplesReady=['question','number','correction'].every((kind)=>S.samples[kind]);
   const readyForApproval=samplesReady&&S.listened.size===3;
   const review=samplesReady&&!w.voice_approved;const status=workflowMessage(w);
-  shell(hero(t(review?'voiceReview':'prepareTitle'),t(review?'voiceReviewText':'prepareIntro'))+`<section class="card preparation-card">${S.busy?`<div class="working-mark" aria-hidden="true">ر</div><h2 role="status">${t(S.phase||'prepareWorking')}</h2><p>${t('prepareWorkingNote')}</p>`:review?`<div class="sample-list">${[['question','questionSample'],['number','numberSample'],['correction','correctionSample']].map(([kind,label])=>`<div class="sample-card"><div><h3>${t(label)}</h3><span id="heard-${kind}" class="small muted">${t(S.listened.has(kind)?'listened':'listen')}</span></div><audio id="sample-${kind}" controls preload="metadata" src="${esc(S.samples[kind])}" aria-label="${t(label)}"></audio></div>`).join('')}</div><p class="small muted">${t('approvalNote')}</p><button id="approveVoice" class="primary" ${!readyForApproval?'disabled':''}>${t('approveVoice')}</button>`:`<div class="preparation-steps"><p><span>1</span>${t('checkingEvidence')}</p><p><span>2</span>${t('creatingVoice')}</p><p><span>3</span>${t('makingSamples')}</p></div><button id="prepareAgent" class="primary" ${blocked||!S.journey.enabled||!w.config?.voice||!w.config?.agent?'disabled':''}>${t(S.correction?'updateAgent':w.voice_approved?'continueSetup':'prepareStart')}</button>`}${status?`<p class="status-note" role="status">${esc(status)}</p>`:''}</section>${configurationCard()}<div class="bottom-actions">${S.call?`<button id="stopTest" class="secondary">${t('stopTest')}</button>`:''}<button id="returnInterview" class="text-button" ${S.busy||S.call?'disabled':''}>${t('addSpeech')}</button><button id="refreshWorkflow" class="secondary" ${S.busy?'disabled':''}>${t('refreshProgress')}</button><button id="revoke" class="text-button danger">${t('revoke')}</button></div>`,true);
+  shell(hero(t(review?'voiceReview':'prepareTitle'),t(review?'voiceReviewText':'prepareIntro'))+`<section class="card preparation-card">${S.busy?`<div class="working-mark" aria-hidden="true">ر</div><h2 role="status">${t(S.phase||'prepareWorking')}</h2><p>${t('prepareWorkingNote')}</p>`:review?`<div class="sample-list">${[['question','questionSample'],['number','numberSample'],['correction','correctionSample']].map(([kind,label])=>`<div class="sample-card"><div><h3>${t(label)}</h3><span id="heard-${kind}" class="small muted">${t(S.listened.has(kind)?'listened':'listen')}</span></div><audio id="sample-${kind}" controls preload="metadata" src="${esc(S.samples[kind])}" aria-label="${t(label)}"></audio></div>`).join('')}</div><p class="small muted">${t('approvalNote')}</p><button id="approveVoice" class="primary" ${!readyForApproval?'disabled':''}>${t('approveVoice')}</button>`:`<div class="preparation-steps"><p><span>1</span>${t('checkingEvidence')}</p><p><span>2</span>${t('creatingVoice')}</p><p><span>3</span>${t('makingSamples')}</p></div><button id="prepareAgent" class="primary" ${blocked||!S.journey.enabled||!w.config?.voice||(w.voice_approved&&!w.config?.agent)?'disabled':''}>${t(S.correction?'updateAgent':w.voice_approved?'continueSetup':'prepareStart')}</button>`}${status?`<p class="status-note" role="status">${esc(status)}</p>`:''}</section>${configurationCard()}<div class="bottom-actions">${S.call?`<button id="stopTest" class="secondary">${t('stopTest')}</button>`:''}<button id="returnInterview" class="text-button" ${S.busy||S.call?'disabled':''}>${t('addSpeech')}</button><button id="refreshWorkflow" class="secondary" ${S.busy?'disabled':''}>${t('refreshProgress')}</button><button id="revoke" class="text-button danger">${t('revoke')}</button></div>`,true);
   for(const kind of ['question','number','correction']){const audio=q('#sample-'+kind);if(audio){audio.onplay=()=>app.querySelectorAll('audio').forEach((other)=>{if(other!==audio)other.pause();});audio.onended=()=>{S.listened.add(kind);q('#heard-'+kind).textContent=t('listened');q('#approveVoice').disabled=S.listened.size!==3;};}}
   bind('#prepareAgent',prepareAgent);bind('#approveVoice',approveVoice);bind('#stopTest',endPreview);
   bind('#refreshWorkflow',async()=>{S.workflowError='';await fetchWorkflow();if(S.workflow.stage==='agent_ready'&&!S.correction){S.page='agent';renderAgent();}else renderPrepare();});
@@ -205,7 +239,6 @@ function renderPrepare(){
 async function prepareAgent(){
   if(S.busy)return;const id=S.session,base=path(),epoch=++S.workflowEpoch;const active=()=>S.session===id&&epoch===S.workflowEpoch&&!S.journey.revoked;S.busy=true;S.workflowError='';S.phase='checkingEvidence';renderPrepare();
   try{
-    const behavior=await post(base+'/behavior',{approve:true},{timeout:30000});if(!active())return;
     if(!S.workflow.voice_approved){
       S.phase='creatingVoice';renderPrepare();
       const voice=await post(base+'/clone',{approve:true,final_seq:S.journey.next_seq-1},{timeout:120000});if(!active())return;
@@ -218,6 +251,7 @@ async function prepareAgent(){
       }
       await fetchWorkflow();
     }else{
+      const behavior=await post(base+'/behavior',{approve:true},{timeout:30000});if(!active())return;
       S.phase='buildingAgent';renderPrepare();await post(base+'/assistant',{approve:true,behavior_id:behavior.id},{timeout:90000});
       if(!active())return;await fetchWorkflow();S.correction=false;S.page='agent';
     }
@@ -246,7 +280,7 @@ async function startPreview(){
     if(!active()){await post(base+'/preview-call/close').catch(()=>{});return;}
     const url=new URL(call.web_call_url);if(url.protocol!=='https:'||!url.hostname.endsWith('.daily.co'))throw Error('invalid_call_url');
     S.call={...call,sessionId:id};S.callNonce=crypto.randomUUID();S.callState='connecting';
-    const frame=document.createElement('iframe');frame.id='agentFrame';frame.title=t('privateTest');frame.src='/vapi-frame';frame.sandbox='allow-scripts allow-same-origin';frame.allow='microphone';frame.referrerPolicy='no-referrer';
+    const frame=document.createElement('iframe');frame.id='agentFrame';frame.title=t('agentTitle');frame.src='/vapi-frame';frame.sandbox='allow-scripts allow-same-origin';frame.allow='microphone';frame.referrerPolicy='no-referrer';
     frame.onload=()=>{if(S.call?.sessionId===id)frame.contentWindow.postMessage({type:'raneen-call-start',nonce:S.callNonce,url:call.web_call_url,token:call.call_token||null,lang:S.lang},location.origin);};
     q('#callMount').appendChild(frame);q('#stopTest').hidden=false;q('#teachCorrection').disabled=true;
     S.callTimer=setTimeout(()=>endPreview().catch(report),(Math.min(call.max_duration_seconds||180,180)+5)*1000);
