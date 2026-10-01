@@ -5,6 +5,8 @@ on:
     branches:
       - work/voice-enrollment-v1
       - work/rve-guided-platform-v1
+      - work/conversation-studio-frontend
+      - work/learning-backend-integrated
       - deploy/render-staging
   workflow_dispatch:
 
