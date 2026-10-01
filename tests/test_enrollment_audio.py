@@ -254,7 +254,7 @@ def test_long_capture_selects_actual_activity_without_filling_with_silence(tmp_p
     assert manifest['active_ms'] <= manifest['total_ms'] <= 125000
     assert manifest['diagnostics']['inspected_chunks'] <= 128
     assert manifest['diagnostics']['saved_reported_ms'] == 1200000
-    assert manifest['selection'] == 'decoded_spread_context_spans_v2'
+    assert manifest['selection'] == 'decoded_ranked_context_spans_v3'
     assert [entry['seq'] for entry in manifest['chunks']] == sorted(entry['seq'] for entry in manifest['chunks'])
     for entry in manifest['chunks']:
         assert entry['sha256'] == sources[entry['seq']]['sha256']
@@ -310,11 +310,11 @@ def test_insufficiency_has_bounded_private_free_diagnostics(tmp_path, decoder):
     with pytest.raises(audio.AudioValidationError) as error:
         audio.prepare_clone_sample(sources, tmp_path / 'samples', min_active_ms=500)
     assert error.value.details == {
-        'saved_reported_ms': 2000, 'captured_chunks': 2, 'inspected_chunks': 2,
+        'saved_reported_ms': 2000, 'captured_chunks': 2, 'inspected_chunks': 2, 'decoder_invocations': 2,
         'decoded_source_ms': 1000, 'decoded_active_ms': 0,
-        'selected_active_ms': 0, 'selected_duration_ms': 0, 'minimum_active_ms': 500,
+        'selected_active_ms': 0, 'selected_duration_ms': 0, 'minimum_active_ms': 500, 'minimum_sample_ms': 500,
         'rejected_chunks': 2, 'rejected_reasons': {'insufficient_audible_audio': 1, 'invalid_audio': 1},
-        'partial': False,
+        'partial': False, 'insufficiency': 'sample_and_activity',
     }
     assert str(tmp_path) not in str(error.value.details)
 
@@ -330,7 +330,9 @@ def test_maximum_candidate_count_and_output_limits_survive_trimming(tmp_path, de
         return real_decode(*args, **kwargs)
     monkeypatch.setattr(audio, '_decode', counted)
     files, manifest = audio.prepare_clone_sample(sources, tmp_path / 'samples', min_active_ms=500, max_sample_ms=2500)
-    assert len(calls) <= 128
+    assert len(calls) <= 256
+    assert manifest['diagnostics']['inspected_chunks'] <= 128
+    assert manifest['diagnostics']['decoder_invocations'] == len(calls)
     assert all(0 < timeout <= 60 for timeout in calls)
     assert manifest['total_ms'] == 2400
     assert manifest['active_ms'] == 1600
@@ -340,11 +342,17 @@ def test_maximum_candidate_count_and_output_limits_survive_trimming(tmp_path, de
 
 def test_total_deadline_restricts_each_decoder_and_returns_no_file(tmp_path, monkeypatch):
     source = chunk(tmp_path)
-    stamps = iter([100.0, 159.5, 161.0])
-    monkeypatch.setattr(audio.time, 'monotonic', lambda: next(stamps))
+    clock = {'now': 100.0}
+    monkeypatch.setattr(audio.time, 'monotonic', lambda: clock['now'])
+    original_read = audio._read_private_file
+    def slow_read(*args, **kwargs):
+        clock['now'] = 159.5
+        return original_read(*args, **kwargs)
+    monkeypatch.setattr(audio, '_read_private_file', slow_read)
     seen = []
     def decoder(*args, **kwargs):
         seen.append(kwargs['timeout_seconds'])
+        clock['now'] = 161.0
         raise audio.AudioValidationError('audio_decode_timeout', 'Synthetic timeout')
     monkeypatch.setattr(audio, '_decode', decoder)
     with pytest.raises(audio.AudioValidationError) as error:
@@ -352,4 +360,103 @@ def test_total_deadline_restricts_each_decoder_and_returns_no_file(tmp_path, mon
     assert seen == [0.5]
     assert error.value.code == 'audio_prepare_timeout'
     assert error.value.details['inspected_chunks'] == 1
+    assert not (tmp_path / 'samples').exists()
+
+
+WORD_GAP_RANGES = [(100, 300), (600, 800), (1100, 1300), (1600, 1800), (2120, 2300), (2620, 2800)]
+
+
+def test_uniform_word_pauses_use_separate_runtime_and_local_activity_policy(tmp_path, decoder):
+    data, _ = patterned_audio(3000, WORD_GAP_RANGES)
+    source = chunk(tmp_path, data=data, claimed_ms=3000)
+    sources = [dict(source, seq=index) for index in range(400)]
+    files, manifest = audio.prepare_clone_sample(
+        sources, tmp_path / 'samples', min_active_ms=30000, min_sample_ms=60000,
+    )
+    assert manifest['total_ms'] == 123000
+    assert manifest['active_ms'] == 47560
+    assert manifest['diagnostics']['minimum_sample_ms'] == 60000
+    assert manifest['diagnostics']['minimum_active_ms'] == 30000
+    assert manifest['diagnostics']['decoder_invocations'] <= 256
+    assert manifest['diagnostics']['inspected_chunks'] == 128
+    assert 'not speech duration' in manifest['screening_limits']
+    with wave.open(files[0]['path'], 'rb') as reader:
+        assert reader.getnframes() == 123000 * 24
+
+
+def test_density_ranking_replaces_early_word_pauses_with_later_better_candidates(tmp_path, decoder):
+    data, _ = patterned_audio(3000, WORD_GAP_RANGES)
+    first = chunk(tmp_path, data=data, claimed_ms=3000)
+    dense = chunk(tmp_path, 1, data=wav_bytes(3000), claimed_ms=3000)
+    sources = [dict(first if index < 200 else dense, seq=index) for index in range(400)]
+    # The legacy 60 s ACTIVITY default must pass when the bounded candidate set
+    # already contains denser audio; no threshold reduction is involved here.
+    files, manifest = audio.prepare_clone_sample(sources, tmp_path / 'samples')
+    assert manifest['total_ms'] == 123000
+    assert manifest['active_ms'] == 123000
+    assert all(entry['seq'] >= 200 for entry in manifest['chunks'])
+    assert [entry['seq'] for entry in manifest['chunks']] == sorted(entry['seq'] for entry in manifest['chunks'])
+    assert manifest['diagnostics']['inspected_chunks'] == 128
+    assert manifest['diagnostics']['decoder_invocations'] == 169
+    with wave.open(files[0]['path'], 'rb') as reader:
+        assert reader.getnframes() == 123000 * 24
+
+
+def test_incomplete_analysis_does_not_claim_entire_capture_insufficient(tmp_path, decoder):
+    source = chunk(tmp_path, data=wav_bytes(3000, silence=True), claimed_ms=3000)
+    sources = [dict(source, seq=index) for index in range(400)]
+    with pytest.raises(audio.AudioValidationError) as error:
+        audio.prepare_clone_sample(sources, tmp_path / 'samples', min_active_ms=30000, min_sample_ms=60000)
+    assert error.value.code == 'audio_analysis_incomplete'
+    assert error.value.details['partial'] is True
+    assert error.value.details['inspected_chunks'] == 128
+    assert error.value.details['insufficiency'] == 'sample_and_activity'
+    assert error.value.details['minimum_sample_ms'] == 60000
+    assert not (tmp_path / 'samples').exists()
+
+
+def test_sample_runtime_gate_is_separate_from_activity(tmp_path, decoder):
+    source = chunk(tmp_path, data=wav_bytes(1000), claimed_ms=1000)
+    with pytest.raises(audio.AudioValidationError) as error:
+        audio.prepare_clone_sample([source], tmp_path / 'samples', min_active_ms=500, min_sample_ms=2000)
+    assert error.value.code == 'insufficient_audio'
+    assert error.value.details['insufficiency'] == 'sample_duration'
+    assert error.value.details['selected_active_ms'] == 1000
+    assert not (tmp_path / 'samples').exists()
+
+
+def test_second_pass_rechecks_checksum_before_using_ranked_metadata(tmp_path, decoder, monkeypatch):
+    source = chunk(tmp_path)
+    actual_read = audio._read_private_file
+    reads = []
+    def changed_between_passes(path, maximum):
+        reads.append(path)
+        if len(reads) == 2:
+            Path(path).write_bytes(wav_bytes(amplitude=7000))
+        return actual_read(path, maximum)
+    monkeypatch.setattr(audio, '_read_private_file', changed_between_passes)
+    with pytest.raises(audio.AudioValidationError) as error:
+        audio.prepare_clone_sample([source], tmp_path / 'samples', min_active_ms=500)
+    assert error.value.code == 'audio_checksum_mismatch'
+    assert len(reads) == 2
+    assert not (tmp_path / 'samples').exists()
+
+
+def test_second_pass_shares_original_deadline_and_cleans_output(tmp_path, decoder, monkeypatch):
+    source = chunk(tmp_path)
+    clock = {'now': 100.0}
+    monkeypatch.setattr(audio.time, 'monotonic', lambda: clock['now'])
+    actual_decode = audio._decode
+    budgets = []
+    def slow_second_pass(*args, **kwargs):
+        budgets.append(kwargs['timeout_seconds'])
+        result = actual_decode(*args, **kwargs)
+        clock['now'] = 159.0 if len(budgets) == 1 else 161.0
+        return result
+    monkeypatch.setattr(audio, '_decode', slow_second_pass)
+    with pytest.raises(audio.AudioValidationError) as error:
+        audio.prepare_clone_sample([source], tmp_path / 'samples', min_active_ms=500)
+    assert budgets == [60.0, 1.0]
+    assert error.value.code == 'audio_prepare_timeout'
+    assert error.value.details['decoder_invocations'] == 2
     assert not (tmp_path / 'samples').exists()

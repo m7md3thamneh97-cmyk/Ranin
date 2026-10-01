@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -237,6 +238,9 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
                 if owner_only and (account['role'] != 'admin' or (request.url.path == '/api/users' and request.method == 'POST')):
                     return Response('Owner-only staging. Employee access is not enabled.', status_code=403, headers={'Cache-Control': 'no-store'})
         max_size = MAX_AUDIO if '/audio' in request.url.path else MAX_JSON
+        if request.method == 'PUT' and re.fullmatch(r'/api/enrollment/sessions/[0-9a-f]{32}/chunks/[0-9]{1,5}', request.url.path):
+            from .enrollment import CHUNK_MAX
+            max_size = CHUNK_MAX
         length = request.headers.get('content-length')
         if request.method in ('POST', 'PUT', 'PATCH'):
             try:

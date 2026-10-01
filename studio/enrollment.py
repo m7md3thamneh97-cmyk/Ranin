@@ -48,6 +48,7 @@ CONSENT_TEXT = (
 CHUNK_MAX = 256 * 1024
 SESSION_MAX = 220 * 1024 * 1024
 MIN_CLONE_MS = 60_000
+MIN_CLONE_ACTIVE_MS = 30_000
 MAX_CLONE_MS = 125_000
 MAX_EVIDENCE = 40
 OPENAI_BASE = "https://api.openai.com/v1"
@@ -1080,7 +1081,10 @@ training and do not claim to be the contributor. Session id: {ident}
         from .enrollment_audio import prepare_clone_sample, AudioValidationError
         chunks = store.all("SELECT * FROM enrollment_chunks WHERE session_id=? ORDER BY seq", (session_id,))
         try:
-            return prepare_clone_sample(chunks, root / session_id / 'samples', min_active_ms=MIN_CLONE_MS, max_sample_ms=MAX_CLONE_MS,final_seq=final_seq)
+            return prepare_clone_sample(
+                chunks, root / session_id / 'samples', min_sample_ms=MIN_CLONE_MS,
+                min_active_ms=MIN_CLONE_ACTIVE_MS, max_sample_ms=MAX_CLONE_MS, final_seq=final_seq,
+            )
         except AudioValidationError as exc:
             detail = {'code': exc.code, 'message': str(exc)}
             if getattr(exc, 'details', None) is not None:
@@ -1127,7 +1131,7 @@ training and do not claim to be the contributor. Session id: {ident}
             if manifest["total_ms"] < minimum:
                 raise HTTPException(
                     409,
-                    {'code': 'insufficient_audio', 'message': f"Need more contributor microphone speech before cloning ({manifest['total_ms']//1000}s selected)."},
+                    {'code': 'insufficient_audio', 'message': f"The selected sample is shorter than the required recording duration ({manifest['total_ms']//1000}s selected)."},
                 )
             manifest_serial = _json(manifest)
             manifest_digest = hashlib.sha256(manifest_serial.encode()).hexdigest()
@@ -1439,24 +1443,40 @@ training and do not claim to be the contributor. Session id: {ident}
 
     @app.get('/api/enrollment/sessions/{ident}/quality')
     async def audio_quality(ident: str, user=Depends(admin)):
-        from .enrollment_audio import validate_audio_chunk, AudioValidationError
         own_session(ident,user)
-        chunks = store.all('SELECT * FROM enrollment_chunks WHERE session_id=? ORDER BY seq',(ident,))
-        active=0; decoded=0; rejected=0
-        candidates=chunks[::max(1,len(chunks)//128)][:128]
-        deadline=time.monotonic()+60
-        inspected=0
-        for chunk in candidates:
-            if time.monotonic()>=deadline: break
-            inspected+=1
+        last = store.one('SELECT MAX(seq) AS final_seq FROM enrollment_chunks WHERE session_id=?', (ident,))
+        final_seq = last['final_seq'] if last['final_seq'] is not None else -1
+        chosen = []
+        error = None
+        try:
             try:
-                result = await asyncio.to_thread(validate_audio_chunk, Path(chunk['path']), mime=chunk['mime'], expected_sha256=chunk['sha256'])
-                decoded += result['duration_ms']
-                if result['usable_for_clone']: active += result['active_ms']
-                else: rejected += 1
-            except AudioValidationError: rejected += 1
-        own_session(ident,user)
-        return {'decoded_ms':decoded,'active_ms':active,'minimum_ms':MIN_CLONE_MS,'rejected_chunks':rejected,'ready_for_clone':active>=MIN_CLONE_MS,'inspected_chunks':inspected,'partial':inspected<len(chunks),'measurement':'Acoustic activity only; does not establish speaker identity or voice quality.'}
+                chosen, manifest = await asyncio.to_thread(select_clone_chunks, ident, final_seq)
+                measurements = manifest.get('diagnostics', {})
+            except HTTPException as exc:
+                if exc.status_code != 409 or not isinstance(exc.detail, dict) or 'code' not in exc.detail:
+                    raise
+                error = exc.detail
+                measurements = error.get('details') or {}
+            own_session(ident,user)
+            result = {
+                **measurements,
+                'decoded_ms': measurements.get('decoded_source_ms', 0),
+                'active_ms': measurements.get('decoded_active_ms', 0),
+                'minimum_ms': MIN_CLONE_MS,
+                'minimum_sample_ms': MIN_CLONE_MS,
+                'minimum_active_ms': MIN_CLONE_ACTIVE_MS,
+                'rejected_chunks': measurements.get('rejected_chunks', 0),
+                'inspected_chunks': measurements.get('inspected_chunks', 0),
+                'partial': measurements.get('partial', error is not None),
+                'ready_for_clone': error is None,
+                'measurement': 'Selected recording duration and local acoustic activity are separate checks. Activity is not measured speech duration, speaker identity, or a provider quality guarantee.',
+            }
+            if error:
+                result.update(error)
+            return result
+        finally:
+            for sample in chosen:
+                Path(sample['path']).unlink(missing_ok=True)
 
     async def stop_preview_calls(ident: str):
         calls = store.all("SELECT * FROM enrollment_preview_calls WHERE session_id=? AND state IN ('open','close_unknown')",(ident,))

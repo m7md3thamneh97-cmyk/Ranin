@@ -18,6 +18,18 @@ test('voice preparation shows measured audible shortfall while preserving the sa
   }
 });
 
+test('sample runtime and incomplete analysis never claim all recorded speech was checked', () => {
+  const error={detail:{code:'insufficient_audio',details:{insufficiency:'sample_duration',selected_duration_ms:49000,minimum_sample_ms:60000,selected_active_ms:35000,minimum_active_ms:30000}}};
+  for(const lang of ['en','ar']){
+    const t=key=>copy[lang][key];
+    const text=workflowFailure(error,t,'creatingVoice');
+    assert.equal(text,copy[lang].sampleAmount.replace('{seconds}','49').replace('{minimum}','60'));
+    const partial=workflowFailure({detail:{code:'audio_analysis_incomplete',message:'Need more audio',details:{selected_active_ms:47000,minimum_active_ms:60000}}},t,'creatingVoice');
+    assert.equal(partial,copy[lang].audioAnalysisIncomplete);
+    assert.notEqual(partial,copy[lang].moreSpeech);
+  }
+});
+
 test('provider and invalid synthesized-audio failures never request more contributor speech', () => {
   const t=key=>copy.en[key];
   for(const code of ['voice_preview_failed','invalid_voice_preview','preview_operation_failed']){
