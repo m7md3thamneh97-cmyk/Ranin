@@ -29,7 +29,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from studio.runtime import create_app
 import studio.enrollment as enrollment
-from studio.enrollment_evidence import RealtimeEvidenceBridge
+from studio.enrollment import LearningRealtimeEvidenceBridge
 
 
 ORIGIN = "https://raneen.test"
@@ -244,7 +244,12 @@ class SyntheticSideband:
         self.pending_confirmation = None
         async def unexpected_failure(*args):
             raise AssertionError("Synthetic sideband failed")
-        self.parser = RealtimeEvidenceBridge(app.state.store, app.state.enrollment_evidence, on_failure=unexpected_failure)
+        self.parser = LearningRealtimeEvidenceBridge(
+            app.state.store, app.state.enrollment_evidence,
+            learning_bridge=app.state.enrollment_learning,
+            instructions=lambda session_id: "Synthetic enrollment instructions.",
+            on_failure=unexpected_failure,
+        )
 
     async def attach(self, session_id, call_id, api_key):
         assert api_key == "synthetic-openai-key"
