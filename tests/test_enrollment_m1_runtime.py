@@ -50,8 +50,8 @@ def confirm(linked, proposal_messages, suffix):
         if m.get('type') == 'response.create' and 'raneen_challenge' in m.get('response', {}).get('metadata', {}))
     row = store.one('SELECT challenge_text FROM enrollment_evidence_provenance WHERE challenge_nonce=?', (challenge,))
     app.state.enrollment_sideband.consume(sid, call, {'type': 'response.done', 'response': {
-        'status': 'completed', 'metadata': {'raneen_challenge': challenge}, 'output': [
-            {'role': 'assistant', 'content': [{'type': 'output_audio', 'transcript': row['challenge_text']}]}]}})
+        'id': 'synthetic-review-' + suffix, 'status': 'completed', 'metadata': {'raneen_challenge': challenge}, 'output': [
+            {'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_audio', 'transcript': row['challenge_text']}]}]}})
     return speak(linked, 'confirm-' + suffix, 'Yes, save this.')
 
 
@@ -81,6 +81,86 @@ def test_journey_binding_is_stable_and_readable_with_the_existing_frontend_contr
     assert client.get(f"/api/profiles/{binding['profile_id']}/learning-state", headers=headers).status_code == 200
     assert client.post(f'/api/enrollment/sessions/{sid}/transcripts', headers=headers,
         json={'item_id': 'browser-injection', 'transcript': 'Yes save this'}).status_code == 410
+
+
+def test_heard_review_is_the_only_compiled_demonstration_and_diagnostics_are_private(linked):
+    client, app, store, owner, headers, sid, call = linked
+    store.execute("UPDATE enrollment_sessions SET voice_id='synthetic_saved_voice',voice_state='ready' WHERE id=?", (sid,))
+    speak(linked, 'review-source', 'I ask the customer to clarify their purpose first.')
+    proposed = tool(linked, 'review-tool', 'propose_evidence', {
+        'kind': 'decision_rule', 'situation': 'UNSPOKEN_ORIGINAL_SITUATION',
+        'interpretation': 'UNSPOKEN_ORIGINAL_INTERPRETATION',
+        'change_condition': 'UNSPOKEN_ORIGINAL_CONDITION', 'replaces_id': ''})
+    challenge = next(m['response']['metadata']['raneen_challenge'] for m in proposed
+        if m.get('type') == 'response.create' and 'raneen_challenge' in m.get('response', {}).get('metadata', {}))
+
+    def readback(status, transcript, nonce=None):
+        app.state.enrollment_sideband.consume(sid, call, {'type': 'response.done', 'response': {
+            'id': 'synthetic_private_readback_response', 'status': status,
+            'metadata': {'raneen_challenge': nonce or challenge}, 'output': [
+                {'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_audio', 'transcript': transcript}]}]}})
+
+    def pending():
+        responses = [client.get(f'/api/enrollment/sessions/{sid}/{route}', headers=headers)
+                     for route in ('journey', 'workflow')]
+        assert all(response.status_code == 200 for response in responses)
+        for response in responses:
+            assert 'UNSPOKEN_ORIGINAL' not in response.text
+            assert 'synthetic_private_readback_response' not in response.text
+            assert challenge not in response.text
+        assert responses[0].json()['pending_review'] == responses[1].json()['pending_review']
+        return responses[0].json()['pending_review']
+
+    assert pending()['status'] == 'awaiting_readback'
+    spoken = 'You first ask whether the customer wants a home or an investment. If that is correct, say Yes, save this.'
+    readback('cancelled', spoken)
+    assert pending()['status'] == 'readback_incomplete'
+    assert pending()['can_confirm'] is False
+    speak(linked, 'review-early-confirmation', 'Yes, save this.')
+    assert app.state.enrollment_evidence.confirmed_rows(sid) == []
+    original_challenge = challenge
+    speak(linked, 'review-repeat-request', 'Please repeat that summary.')
+    repeated = tool(linked, 'review-repeat-tool', 'repeat_pending_review', {})
+    assert result(repeated)['evidence_id'] == result(proposed)['evidence_id']
+    challenge = next(m['response']['metadata']['raneen_challenge'] for m in repeated
+        if m.get('type') == 'response.create' and 'raneen_challenge' in m.get('response', {}).get('metadata', {}))
+    assert challenge != original_challenge
+    assert pending()['status'] == 'awaiting_readback'
+    readback('completed', spoken, original_challenge)
+    assert pending()['can_confirm'] is False
+    readback('completed', spoken)
+    review = pending()
+    assert review['status'] == 'review_ready' and review['can_confirm'] is True
+    assert review['confirmation_phrase'] == 'Yes, save this'
+    other = store.create_user('Synthetic isolated owner', 'admin')
+    other_headers = {'Authorization': 'Bearer ' + other['token']}
+    for route in ('journey', 'workflow'):
+        assert client.get(f'/api/enrollment/sessions/{sid}/{route}', headers=other_headers).status_code == 403
+    speak(linked, 'review-later-confirmation', 'Yes, save this.')
+    assert pending() is None
+    compiled = client.post(f'/api/enrollment/sessions/{sid}/behavior', headers=headers, json={'approve': True})
+    assert compiled.status_code == 201, compiled.text
+    behavior = store.one('SELECT payload FROM enrollment_behavior_versions WHERE id=?', (compiled.json()['id'],))
+    assert spoken in behavior['payload']
+    assert 'UNSPOKEN_ORIGINAL' not in behavior['payload']
+    assert 'draft_proposal' not in behavior['payload']
+    assert 'spoken_review' not in behavior['payload']
+    assert 'synthetic_private_readback_response' not in behavior['payload']
+    assert json.loads(behavior['payload'])['evidence'][0]['demonstration']['source_transcript'] == 'I ask the customer to clarify their purpose first.'
+    assert store.one('SELECT voice_id FROM enrollment_sessions WHERE id=?', (sid,))['voice_id'] == 'synthetic_saved_voice'
+
+
+def test_behavior_compiler_revalidates_review_before_exporting_a_demonstration(linked):
+    client, app, store, owner, headers, sid, call = linked
+    teach(linked)
+    evidence = app.state.enrollment_evidence.confirmed_rows(sid)[0]
+    payload = json.loads(evidence['payload'])
+    payload['interpretation'] = 'UNHEARD_CHANGED_INTERPRETATION'
+    store.execute('UPDATE enrollment_evidence SET payload=? WHERE id=?', (json.dumps(payload), evidence['id']))
+    response = client.post(f'/api/enrollment/sessions/{sid}/behavior', headers=headers, json={'approve': True})
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'confirmed_evidence_required'
+    assert store.all('SELECT * FROM enrollment_behavior_versions') == []
 
 
 def test_spoken_learning_practice_correction_retry_updates_version_and_preserves_original(linked):

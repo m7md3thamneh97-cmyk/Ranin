@@ -163,6 +163,7 @@ def confirm_pattern(c, owner, sid, suffix="1"):
     store.execute("INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET call_id=excluded.call_id,state='open'", (sid, call_id, "open", now(), now()))
     first, second = "synthetic-answer-" + suffix, "synthetic-approval-" + suffix
     evidence.mark_audio(sid, call_id, first)
+    c.app.state.enrollment_learning.note_mode(sid, call_id, first)
     evidence.mark_audio(sid, call_id, first, committed=True)
     evidence.record_transcript(sid, call_id, first, "لا، مليون ونص، مش مليونين.")
     proposal = evidence.propose(sid, call_id, "synthetic-tool-" + suffix, {
@@ -174,6 +175,7 @@ def confirm_pattern(c, owner, sid, suffix="1"):
     assert proposal["ok"]
     assert evidence.verify_readback(sid, call_id, proposal["challenge_nonce"], proposal["challenge_text"])
     evidence.mark_audio(sid, call_id, second)
+    c.app.state.enrollment_learning.note_mode(sid, call_id, second)
     evidence.mark_audio(sid, call_id, second, committed=True)
     result = evidence.record_transcript(sid, call_id, second, "Yes, save this.")
     assert result["status"] == "confirmed"

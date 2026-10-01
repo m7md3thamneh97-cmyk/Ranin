@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {workflowFailure} from '../studio/static/enrollment-errors.js';
 import {copy} from '../studio/static/enrollment-copy.js';
-import {confirmedResponseCount, needsResponseTeaching, hasPendingSpokenReview} from '../studio/static/enrollment-evidence-status.js';
+import {confirmedResponseCount, needsResponseTeaching, hasPendingSpokenReview, spokenReviewMessage} from '../studio/static/enrollment-evidence-status.js';
 
 const {ChunkQueue, InterviewCapture} = await import('../studio/static/enrollment-capture.js');
 
@@ -98,6 +98,56 @@ test('spoken review hint follows server pending state and never treats it as app
   for(const lang of ['en','ar']){
     assert.ok(copy[lang].spokenReviewHint.includes('نعم احفظ هذا'));
     assert.ok(copy[lang].spokenReviewHint.includes('Yes, save this'));
+  }
+});
+test('incomplete spoken review asks for a repeat while completed review still requires exact human approval', () => {
+  const journey={pending_patterns:1,confirmed_patterns:0};
+  for(const lang of ['en','ar']){
+    const t=key=>copy[lang][key];
+    const workflow=pending_review=>({pending_review});
+    for(const [status,key] of [
+      ['awaiting_readback','spokenReviewAwaitingHint'],
+      ['readback_incomplete','spokenReviewIncompleteHint'],
+      ['readback_mismatch','spokenReviewMismatchHint'],
+    ]){
+      const pending={status,can_confirm:false,confirmation_phrase:'private-provider-detail'};
+      const message=spokenReviewMessage(journey,workflow(pending),t);
+      assert.equal(message,copy[lang][key]);
+      assert.ok(!message.includes('private-provider-detail'));
+      assert.ok(!message.includes('{confirmation}'));
+      assert.equal(confirmedResponseCount(journey,workflow(pending)),0);
+    }
+    for(const phrase of ['Yes, save this','نعم احفظ هذا']){
+      const pending={status:'review_ready',can_confirm:true,confirmation_phrase:phrase};
+      assert.equal(spokenReviewMessage(journey,workflow(pending),t),copy[lang].spokenReviewReadyHint.replace('{confirmation}',phrase));
+      assert.equal(confirmedResponseCount(journey,workflow(pending)),0);
+    }
+    assert.equal(spokenReviewMessage(journey,workflow({status:'review_ready',can_confirm:false}),t),copy[lang].spokenReviewAwaitingHint);
+    assert.equal(spokenReviewMessage(journey,workflow({status:'review_ready',can_confirm:'true'}),t),copy[lang].spokenReviewAwaitingHint);
+    assert.equal(spokenReviewMessage(journey,workflow({status:'review_ready',can_confirm:true,confirmation_phrase:'private-provider-detail'}),t),copy[lang].spokenReviewReadyHint.replace('{confirmation}',copy[lang].spokenReviewConfirmationPhrase));
+    assert.equal(spokenReviewMessage(journey,{},t),copy[lang].spokenReviewHint);
+    assert.equal(spokenReviewMessage(journey,workflow({status:'private-provider-detail'}),t),copy[lang].spokenReviewHint);
+    assert.equal(spokenReviewMessage(journey,workflow({status:'constructor'}),t),copy[lang].spokenReviewHint);
+    assert.equal(spokenReviewMessage({pending_review:{status:'readback_incomplete'}},{},t),copy[lang].spokenReviewIncompleteHint);
+  }
+  assert.equal(hasPendingSpokenReview({pending_review:{status:'review_ready'}}),true);
+  assert.equal(hasPendingSpokenReview({revoked:true,pending_review:{status:'review_ready'}}),false);
+});
+test('fresh journey review replaces stale workflow guidance and explicit null clears it', () => {
+  const awaiting={status:'awaiting_readback',can_confirm:false};
+  const ready={status:'review_ready',can_confirm:true,confirmation_phrase:'نعم احفظ هذا'};
+  for(const lang of ['en','ar']){
+    const t=key=>copy[lang][key];
+    const journey={pending_patterns:1,pending_review:ready};
+    const oldWorkflow={pending_review:awaiting};
+    assert.equal(hasPendingSpokenReview(journey,oldWorkflow),true);
+    assert.equal(spokenReviewMessage(journey,oldWorkflow,t),copy[lang].spokenReviewReadyHint.replace('{confirmation}','نعم احفظ هذا'));
+    assert.equal(spokenReviewMessage({pending_review:awaiting},{pending_review:ready},t),copy[lang].spokenReviewAwaitingHint);
+    const cleared={pending_patterns:0,pending_review:null};
+    assert.equal(hasPendingSpokenReview(cleared,{pending_review:ready}),false);
+    assert.equal(spokenReviewMessage(cleared,{pending_review:ready},t),copy[lang].spokenReviewHint);
+    assert.equal(hasPendingSpokenReview({pending_patterns:0},{pending_review:ready}),true);
+    assert.equal(spokenReviewMessage({pending_patterns:0},{pending_review:ready},t),copy[lang].spokenReviewReadyHint.replace('{confirmation}','نعم احفظ هذا'));
   }
 });
 const deferred = () => {

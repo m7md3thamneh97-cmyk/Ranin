@@ -98,6 +98,75 @@ def test_raw_legacy_confirmed_row_without_audio_provenance_never_imports(env):
     assert store.all('SELECT * FROM observations') == []
 
 
+@pytest.mark.parametrize('review,approval', [
+    ('I ask whether they want to live in the home or invest before I ask the next missing detail. If that is correct, say Yes, save this.', 'Yes, save this.'),
+    ('اول شي اسأل العميل اذا يبي العقار للسكن او للاستثمار، وبعدها اسأل عن المعلومة الناقصة. إذا هذا صحيح، قل نعم احفظ هذا.', 'نعم احفظ هذا'),
+])
+def test_paraphrased_spoken_review_compiles_without_any_unspoken_draft_fields(env, review, approval):
+    store, owner, sid, call, evidence, learning, simulation, bridge = env
+    store.execute("UPDATE enrollment_sessions SET voice_id='existing-consented-voice' WHERE id=?", (sid,))
+    source = 'My first question is whether the caller wants to live in the home or invest.'
+    audio(env, 'paraphrase-source', source)
+    proposal = evidence.propose(sid, call, 'paraphrase-tool', {
+        'kind': 'decision_rule', 'situation': 'DRAFT_ONLY_SITUATION_TOKEN',
+        'interpretation': 'DRAFT_ONLY_INTERPRETATION_TOKEN',
+        'change_condition': 'DRAFT_ONLY_CONDITION_TOKEN', 'replaces_id': '',
+    })
+    assert evidence.verify_readback(sid, call, proposal['challenge_nonce'], review, response_id='resp_actual_spoken_review')
+    assert bridge.sync_trusted(sid)['imported_evidence_ids'] == []
+    assert audio(env, 'paraphrase-approval', approval)['status'] == 'confirmed'
+    assert bridge.sync_trusted(sid)['imported_evidence_ids'] == [proposal['evidence_id']]
+    context = bridge.context(sid)
+    serialized = json.dumps(context, ensure_ascii=False)
+    assert 'DRAFT_ONLY_' not in serialized and 'draft_proposal' not in serialized
+    assert context['enrollment_demonstrations'][0]['interpretation'] == review
+    assert context['enrollment_demonstrations'][0]['source_transcript'] == source
+    assert authorize_learning_context(store, bridge.ensure_binding(sid)['profile_id'], context)
+    assert store.one('SELECT voice_id FROM enrollment_sessions WHERE id=?', (sid,))['voice_id'] == 'existing-consented-voice'
+
+
+@pytest.mark.parametrize('field,invalid', [
+    ('response_id', ''), ('call_id', 'another-contributor-call'),
+    ('challenge_nonce', 'another-proposal'), ('status', 'cancelled'),
+    ('spoken_after_ordinal', -1), ('verbatim', None),
+])
+def test_paraphrased_review_proof_is_revalidated_before_learning_and_provider_use(env, field, invalid):
+    store, owner, sid, call, evidence, learning, simulation, bridge = env
+    audio(env, 'proof-source', 'I ask whether the home is for living or investing.')
+    proposal = evidence.propose(sid, call, 'proof-tool', {'kind': 'decision_rule', 'situation': 'A new customer calls.',
+        'interpretation': 'Ask their intent first.', 'change_condition': 'Ask the next missing fact afterward.', 'replaces_id': ''})
+    review = 'I establish whether the caller wants to live in the home or invest before asking another question. If that is correct, say Yes, save this.'
+    assert evidence.verify_readback(sid, call, proposal['challenge_nonce'], review, response_id='resp_proof_review')
+    assert audio(env, 'proof-approval', 'Yes, save this.')['status'] == 'confirmed'
+    bridge.sync_trusted(sid)
+    original_context = bridge.context(sid)
+    payload = json.loads(store.one('SELECT payload FROM enrollment_evidence WHERE id=?', (proposal['evidence_id'],))['payload'])
+    payload['spoken_review'][field] = invalid
+    store.execute('UPDATE enrollment_evidence SET payload=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), proposal['evidence_id']))
+    assert bridge.context(sid)['personal_rules'] == []
+    with pytest.raises(HTTPException) as error:
+        authorize_learning_context(store, bridge.ensure_binding(sid)['profile_id'], original_context)
+    assert error.value.status_code == 409
+
+
+def test_new_readback_with_negated_draft_uses_actual_spoken_meaning(env):
+    store, owner, sid, call, evidence, learning, simulation, bridge = env
+    audio(env, 'negation-source', 'I do not begin by asking about budget.')
+    proposal = evidence.propose(sid, call, 'negation-tool', {'kind': 'decision_rule', 'situation': 'A new buyer calls.',
+        'interpretation': 'Ask budget first.', 'change_condition': 'Ask location next.', 'replaces_id': ''})
+    # Every draft field occurs as a substring; only the actual spoken review
+    # says that the first instruction should never be followed.
+    review = 'A new buyer calls. Never Ask budget first. Ask location next. If that is correct, say Yes, save this.'
+    assert evidence.verify_readback(sid, call, proposal['challenge_nonce'], review, response_id='resp_negated_review')
+    assert audio(env, 'negation-approval', 'Yes, save this.')['status'] == 'confirmed'
+    bridge.sync_trusted(sid)
+    context = bridge.context(sid)
+    assert context['enrollment_demonstrations'][0]['interpretation'] == review
+    payload = json.loads(evidence.confirmed_rows(sid)[0]['payload'])
+    assert payload['spoken_review']['verbatim'] is False
+    assert payload['draft_proposal']['interpretation'] == 'Ask budget first.'
+
+
 def test_customer_simulation_audio_is_excluded_even_if_a_pattern_was_confirmed(env):
     store, owner, sid, call, evidence, learning, simulation, bridge = env
     bridge.start_simulation(sid, 'purpose-01')

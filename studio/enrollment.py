@@ -906,6 +906,7 @@ def install(app):
             result['can_resume'] = False
         if not row['revoked_at']:
             result['learning'] = app.state.enrollment_learning.journey(ident)
+            result['pending_review'] = app.state.enrollment_evidence.pending_review(ident)
         return result
 
     @app.get("/api/enrollment/sessions/{ident}")
@@ -1263,7 +1264,8 @@ training and do not claim to be the contributor. Session id: {ident}
         row = own_session(ident, user)
         app.state.enrollment_learning.sync_trusted(ident)
         learned_context = app.state.enrollment_learning.context(ident)
-        confirmed = app.state.enrollment_evidence.confirmed_rows(ident)
+        trusted_ids = {item['evidence_id'] for item in learned_context.get('enrollment_demonstrations', [])}
+        confirmed = [item for item in app.state.enrollment_evidence.confirmed_rows(ident) if item['id'] in trusted_ids]
         if not confirmed:
             raise HTTPException(409, {'code':'confirmed_evidence_required','message':'No confirmed spoken evidence is available yet.'})
         payload = {
@@ -1277,7 +1279,10 @@ training and do not claim to be the contributor. Session id: {ident}
                     "id": x["id"],
                     "kind": x["kind"],
                     "source_item_id": x["source_item_id"],
-                    "demonstration": json.loads(x["payload"]),
+                    "demonstration": {
+                        key: value for key, value in json.loads(x["payload"]).items()
+                        if key in {"kind", "situation", "interpretation", "change_condition", "source_transcript", "replaces_id"}
+                    },
                     "confirmation_transcript": x["confirmation_transcript"],
                 }
                 for x in confirmed
@@ -1790,6 +1795,7 @@ training and do not claim to be the contributor. Session id: {ident}
                 'preview_retry_allowed': preview_retry_allowed}
         if not row['revoked_at']:
             result['learning'] = app.state.enrollment_learning.journey(ident)
+            result['pending_review'] = app.state.enrollment_evidence.pending_review(ident)
         return result
 
     @app.get('/api/enrollment/sessions/{ident}/workflow')

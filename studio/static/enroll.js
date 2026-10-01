@@ -5,7 +5,7 @@ import { icon, orb, uiText, learningPanel } from "./conversation-ui.js";
 import { ConversationFeed, semanticEvents } from "./conversation-events.js";
 import { LearningConnection, learningBinding } from "./learning-api.js";
 import { testerText, testerFailure, signInWithCode, saveTesterCode, showTesterInvitations } from "./tester-access-ui.js";
-import { confirmedResponseCount, needsResponseTeaching, hasPendingSpokenReview } from "./enrollment-evidence-status.js";
+import { confirmedResponseCount, needsResponseTeaching, hasPendingSpokenReview, spokenReviewMessage } from "./enrollment-evidence-status.js";
 // Retire the earlier enrollment credential cache. This flow keeps access in memory.
 try {
   sessionStorage.removeItem("raneen-token");
@@ -770,7 +770,7 @@ function update() {
   );
   const review = q("#spokenReview");
   review.hidden = !live || !hasPendingSpokenReview(j, S.workflow);
-  review.textContent = t("spokenReviewHint");
+  review.textContent = spokenReviewMessage(j, S.workflow, t);
   if (!live && !connecting && needsResponseTeaching(j, S.workflow))
     q("#interviewSupport").textContent = t("responseTeachingIntro");
   q("#newInterview").hidden =

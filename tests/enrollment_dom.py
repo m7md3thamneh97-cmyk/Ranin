@@ -275,7 +275,7 @@ class SyntheticSideband:
         }]}})
         challenge = next(item["response"] for item in messages if item["type"] == "response.create")
         readback = json.loads(challenge["instructions"].partition(": ")[2])
-        consume({"type": "response.done", "response": {"status": "completed", "metadata": challenge["metadata"], "output": [{"role": "assistant", "content": [{"type": "audio", "transcript": readback}]}]}})
+        consume({"type": "response.done", "response": {"id": "synthetic-review-" + str(len(self.calls)), "status": "completed", "metadata": challenge["metadata"], "output": [{"type": "message", "status": "completed", "role": "assistant", "content": [{"type": "audio", "transcript": readback}]}]}})
         if self.hold_confirmation:
             self.pending_confirmation = lambda: spoken("synthetic-confirmation", "Yes, save this")
             return
