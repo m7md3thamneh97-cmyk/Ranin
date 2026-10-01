@@ -278,11 +278,14 @@ test('revoke-style pause releases local media and prevents final audio from bein
   assert.equal(capture.queue.hasPending, true);
 });
 
-test('disconnect closes the old peer and allows a new connection after saved audio drains', async () => {
+test('a sustained disconnect closes the old peer and allows a new connection after saved audio drains', async (t) => {
+  t.mock.timers.enable({apis: ['setTimeout']});
   const {capture, streams, errors} = harness();
   await capture.start();
   const oldPeer = capture.pc;
   oldPeer.disconnect();
+  assert.equal(oldPeer.closed, false, 'a brief disruption must not hang up the call');
+  t.mock.timers.tick(5000);
   assert.equal(oldPeer.closed, true);
   assert.equal(streams[0].track.stops, 1);
   await until(() => !capture.pausing);
@@ -291,6 +294,63 @@ test('disconnect closes the old peer and allows a new connection after saved aud
   assert.equal(capture.pc.closed, false);
   assert.equal(streams.length, 2);
   assert.equal(errors.some(error => error.message === 'connection_lost'), true);
+  await capture.pause();
+});
+
+test('a transient disconnect recovers without stopping capture or creating another call', async (t) => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  let opens = 0, closes = 0;
+  const {capture, streams, errors} = harness({
+    openConnection: async () => { opens++; return 'synthetic-answer'; },
+    closeConnection: async () => { closes++; return true; },
+  });
+  await capture.start();
+  const peer = capture.pc, recorder = capture.recorder;
+  peer.disconnect();
+  t.mock.timers.tick(2000);
+  peer.connectionState = 'connected';
+  peer.onconnectionstatechange();
+  t.mock.timers.tick(5000);
+  assert.equal(capture.state, 'live');
+  assert.equal(capture.pc, peer);
+  assert.equal(capture.recorder, recorder);
+  assert.equal(streams[0].track.stops, 0);
+  assert.equal(opens, 1);
+  assert.equal(closes, 0);
+  assert.equal(errors.length, 0);
+  await capture.pause();
+});
+
+test('pause cancels disconnect recovery so an old timer cannot end a resumed interview', async (t) => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  let closes = 0;
+  const {capture, errors} = harness({closeConnection: async () => { closes++; return true; }});
+  await capture.start();
+  capture.pc.disconnect();
+  await capture.pause();
+  await capture.start();
+  t.mock.timers.tick(5000);
+  assert.equal(capture.state, 'live');
+  assert.equal(closes, 1);
+  assert.equal(errors.length, 0);
+  await capture.pause();
+});
+
+test('the live interviewer sends and records only an echo-protected microphone stream', async () => {
+  const stream = fakeStream(), sentTracks = [];
+  let constraints;
+  class RecordingPeer extends FakePeer {
+    addTrack(track, source) { sentTracks.push({track, source}); }
+  }
+  const {capture} = harness({Peer: RecordingPeer,
+    mediaDevices: {getUserMedia: async (requested) => { constraints = requested; return stream; }}});
+  await capture.start();
+  assert.equal(constraints.audio.echoCancellation, true);
+  assert.equal(constraints.audio.noiseSuppression, true);
+  assert.equal(constraints.audio.autoGainControl, false);
+  assert.equal(constraints.video, false);
+  assert.deepEqual(sentTracks, [{track: stream.track, source: stream}]);
+  assert.equal(capture.recorder.stream, stream, 'record the protected mic, never the remote playback');
   await capture.pause();
 });
 
