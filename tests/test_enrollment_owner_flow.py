@@ -57,6 +57,8 @@ def test_provider_id_and_invalid_mp3_never_establish_voice_ready(env,monkeypatch
     fake.eleven_speech=invalid
     response=c.post(f'/api/enrollment/sessions/{sid}/preview',headers=auth(owner),json={'approve':True,'kind':'question'})
     assert response.status_code==502
+    assert response.json()['detail']['code'] == 'invalid_voice_preview'
+    assert isinstance(response.json()['detail']['message'], str)
     state=c.get(f'/api/enrollment/sessions/{sid}/workflow',headers=auth(owner)).json()
     assert state['voice_state']=='sample_required' and not state['voice_approved'] and not state['preview_allowed']
 
@@ -301,3 +303,107 @@ def test_exactly_ten_interview_seconds_remaining_reuses_existing_session(env, mo
     journey = client.get(f'/api/enrollment/sessions/{old_sid}/journey', headers=auth(owner)).json()
     assert journey['interview_seconds_left'] == 10
     assert journey['resume_limit'] is None and journey['can_resume'] is True
+
+
+def test_short_saved_audio_returns_structured_insufficiency_before_provider_dispatch(env, monkeypatch):
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    assert upload(client, owner, sid, 0, duration=1000).status_code == 200
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                           json={'approve': True, 'final_seq': 0})
+    assert response.status_code == 409
+    detail = response.json()['detail']
+    assert detail['code'] == 'insufficient_audio' and isinstance(detail['message'], str)
+    assert fake.clone_calls == 0
+    assert not app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=?', (sid,))
+
+
+def test_audio_validation_details_survive_endpoint_mapping(env, monkeypatch):
+    from studio.enrollment_audio import AudioValidationError
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    measured = {'active_ms': 12000, 'minimum_ms': 60000, 'inspected_chunks': 20}
+
+    def insufficient(*args, **kwargs):
+        error = AudioValidationError('insufficient_audio', 'Only twelve seconds of usable audio were found.')
+        error.details = measured
+        raise error
+
+    monkeypatch.setattr('studio.enrollment_audio.prepare_clone_sample', insufficient)
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                           json={'approve': True, 'final_seq': 0})
+    assert response.status_code == 409
+    assert response.json()['detail'] == {'code': 'insufficient_audio',
+                                         'message': 'Only twelve seconds of usable audio were found.', 'details': measured}
+    assert fake.clone_calls == 0
+
+
+def test_missing_audio_decoder_is_not_reported_as_more_speech_needed(env, monkeypatch):
+    from studio.enrollment_audio import DecoderUnavailable
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+
+    def unavailable(*args, **kwargs):
+        raise DecoderUnavailable()
+
+    monkeypatch.setattr('studio.enrollment_audio.prepare_clone_sample', unavailable)
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                           json={'approve': True, 'final_seq': 0})
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'decoder_unavailable'
+    assert fake.clone_calls == 0
+
+
+@pytest.mark.parametrize('uncertain,status,code,state', [
+    (False, 422, 'voice_clone_failed', 'failed'),
+    (True, 502, 'outcome_unknown', 'outcome_unknown'),
+])
+def test_clone_provider_error_codes_preserve_operation_semantics(env, monkeypatch, uncertain, status, code, state):
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    for seq in range(4):
+        assert upload(client, owner, sid, seq).status_code == 200
+    fake.clone_error = ProviderError('Synthetic provider clone failure.', uncertain=uncertain)
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                           json={'approve': True, 'final_seq': 3})
+    assert response.status_code == status
+    assert response.json()['detail'] == {'code': code, 'message': 'Synthetic provider clone failure.'}
+    operation = app.state.store.one("SELECT state FROM enrollment_operations WHERE session_id=? AND kind='voice_clone'", (sid,))
+    assert operation['state'] == state
+    again = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                        json={'approve': True, 'final_seq': 3})
+    assert again.status_code == (200 if uncertain else 409)
+    if not uncertain:
+        assert again.json()['detail']['code'] == 'voice_clone_failed'
+    assert fake.clone_calls == 1
+
+
+@pytest.mark.parametrize('uncertain,code,state', [
+    (False, 'voice_preview_failed', 'failed'),
+    (True, 'outcome_unknown', 'outcome_unknown'),
+])
+def test_synthesis_provider_failure_is_not_audio_insufficiency(env, monkeypatch, uncertain, code, state):
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    app.state.store.execute("UPDATE enrollment_sessions SET voice_id='voice_test_123456',voice_state='sample_required' WHERE id=?", (sid,))
+    attempts = []
+
+    async def failed_synthesis(*args):
+        attempts.append(True)
+        raise ProviderError('Synthetic speech synthesis failed.', uncertain=uncertain)
+
+    fake.eleven_speech = failed_synthesis
+    response = client.post(f'/api/enrollment/sessions/{sid}/preview', headers=auth(owner),
+                           json={'approve': True, 'kind': 'question'})
+    assert response.status_code == 502
+    assert response.json()['detail'] == {'code': code, 'message': 'Synthetic speech synthesis failed.'}
+    assert app.state.store.one("SELECT state FROM enrollment_operations WHERE session_id=? AND kind='voice_preview'", (sid,))['state'] == state
+    again = client.post(f'/api/enrollment/sessions/{sid}/preview', headers=auth(owner),
+                        json={'approve': True, 'kind': 'question'})
+    assert again.status_code == 409 and len(attempts) == 1
+    assert again.json()['detail']['code'] == code

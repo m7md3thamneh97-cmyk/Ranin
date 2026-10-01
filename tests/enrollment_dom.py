@@ -313,6 +313,7 @@ def main():
             page.set_default_timeout(10000)
             errors, external_requests, csp_errors, frame_headers = [], [], [], []
             session_create_requests = []
+            faults = {"clone_shortfall": False}
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.on("console", lambda item: csp_errors.append(item.text) if item.type == "error" and "Content Security Policy" in item.text else None)
             page.on("dialog", lambda dialog: dialog.accept())
@@ -327,6 +328,14 @@ def main():
                 if parsed.path == "/static/vendor/daily-0.87.0.js":
                     assert "authorization" not in request.all_headers(), "Owner access must not be passed into the call SDK"
                     route.fulfill(status=200, content_type="application/javascript", body=FAKE_DAILY)
+                    return
+                if request.method == "POST" and parsed.path.endswith("/clone") and faults["clone_shortfall"]:
+                    faults["clone_shortfall"] = False
+                    route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": {
+                        "code": "insufficient_audio", "message": "synthetic audible shortfall",
+                        "details": {"selected_active_ms": 49000, "minimum_active_ms": 60000,
+                                    "decoded_source_ms": 123000, "rejected_reasons": {}},
+                    }}))
                     return
                 path = parsed.path + ("?" + parsed.query if parsed.query else "")
                 if request.method == "POST" and parsed.path == "/api/enrollment/sessions":
@@ -434,7 +443,19 @@ def main():
 
                 # Complete the real preparation UI with synthetic provider audio.
                 # Playback is muted; real HTML audio decoding/ended events run.
+                saved_before = app.state.store.all("SELECT seq,sha256,byte_count FROM enrollment_chunks WHERE session_id=? ORDER BY seq", (session_id,))
+                faults["clone_shortfall"] = True
                 page.locator("#finish").click()
+                shortfall = page.locator(".preparation-card .status-note[role=status]")
+                expect(shortfall).to_contain_text("Your recording is saved.")
+                expect(shortfall).to_contain_text("49s")
+                expect(shortfall).to_contain_text("60s needed")
+                expect(page.locator("#prepareAgent")).to_be_enabled()
+                assert faults["clone_shortfall"] is False
+                assert not fake.clone_calls and not fake.speech_calls
+                assert app.state.store.all("SELECT seq,sha256,byte_count FROM enrollment_chunks WHERE session_id=? ORDER BY seq", (session_id,)) == saved_before
+                page.screenshot(path=str(output / "enrollment-audio-shortfall-en.png"), full_page=True)
+                page.locator("#prepareAgent").click()
                 expect(page.locator("#sample-question")).to_be_visible(timeout=30000)
                 expect(page.locator("#approveVoice")).to_be_disabled()
                 assert len(fake.clone_calls) == 1

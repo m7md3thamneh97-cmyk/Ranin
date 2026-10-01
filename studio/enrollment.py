@@ -1082,7 +1082,10 @@ training and do not claim to be the contributor. Session id: {ident}
         try:
             return prepare_clone_sample(chunks, root / session_id / 'samples', min_active_ms=MIN_CLONE_MS, max_sample_ms=MAX_CLONE_MS,final_seq=final_seq)
         except AudioValidationError as exc:
-            raise HTTPException(409, str(exc)) from None
+            detail = {'code': exc.code, 'message': str(exc)}
+            if getattr(exc, 'details', None) is not None:
+                detail['details'] = exc.details
+            raise HTTPException(409, detail) from None
 
     def latest_voice_version(session_id: str):
         return store.one(
@@ -1124,7 +1127,7 @@ training and do not claim to be the contributor. Session id: {ident}
             if manifest["total_ms"] < minimum:
                 raise HTTPException(
                     409,
-                    f"Need more contributor microphone speech before cloning ({manifest['total_ms']//1000}s selected).",
+                    {'code': 'insufficient_audio', 'message': f"Need more contributor microphone speech before cloning ({manifest['total_ms']//1000}s selected)."},
                 )
             manifest_serial = _json(manifest)
             manifest_digest = hashlib.sha256(manifest_serial.encode()).hexdigest()
@@ -1144,8 +1147,9 @@ training and do not claim to be the contributor. Session id: {ident}
                     }
                 raise HTTPException(
                     409,
-                    f"Voice clone operation for this exact sample set is {operation['state']}; "
-                    "do not retry it blindly. Capture different approved audio or reconcile the provider outcome.",
+                    {'code': 'outcome_unknown' if operation['state'] in {'dispatching', 'outcome_unknown'} else 'voice_clone_failed',
+                     'message': f"Voice clone operation for this exact sample set is {operation['state']}; "
+                                "do not retry it blindly. Reconcile the provider outcome before retrying."},
                 )
 
             next_version = store.one(
@@ -1193,7 +1197,10 @@ training and do not claim to be the contributor. Session id: {ident}
                     "UPDATE enrollment_sessions SET voice_state=?,updated=? WHERE id=?",
                     (state, now(), ident),
                 )
-                raise HTTPException(502 if exc.uncertain else 422, str(exc)) from None
+                raise HTTPException(502 if exc.uncertain else 422, {
+                    'code': 'outcome_unknown' if exc.uncertain else 'voice_clone_failed',
+                    'message': str(exc),
+                }) from None
             state = "verification_required" if result["requires_verification"] else "sample_required"
             op_update(
                 operation["id"],
@@ -1244,13 +1251,25 @@ training and do not claim to be the contributor. Session id: {ident}
         if not fresh:
             if operation["state"] == "succeeded" and preview_path.is_file():
                 return FileResponse(preview_path, media_type="audio/mpeg")
-            raise HTTPException(409, f"Preview operation is {operation['state']}; reconcile it before retrying.")
+            raise HTTPException(409, {
+                'code': 'outcome_unknown' if operation['state'] in {'dispatching', 'outcome_unknown'} else 'voice_preview_failed',
+                'message': f"Preview operation is {operation['state']}; reconcile it before retrying.",
+            })
         try:
             audio = await app.state.enrollment_provider.eleven_speech(api_key, row["voice_id"], PREVIEW_TEXT[body.kind])
             quality = await asyncio.to_thread(validate_synthesized_audio, audio)
         except (ProviderError, AudioValidationError) as exc:
             op_update(operation["id"], "outcome_unknown" if getattr(exc,'uncertain',False) else "failed", detail={"error": str(exc)})
-            raise HTTPException(502, str(exc)) from None
+            if getattr(exc, 'uncertain', False):
+                code = 'outcome_unknown'
+            elif isinstance(exc, AudioValidationError):
+                code = 'decoder_unavailable' if exc.code == 'decoder_unavailable' else 'invalid_voice_preview'
+            else:
+                code = 'voice_preview_failed'
+            detail = {'code': code, 'message': str(exc)}
+            if getattr(exc, 'details', None) is not None:
+                detail['details'] = exc.details
+            raise HTTPException(502, detail) from None
         # Provider completion is recorded before checking consent again. A withdrawn
         # enrollment never receives the late sample or reactivates playback.
         with store.db() as db:
