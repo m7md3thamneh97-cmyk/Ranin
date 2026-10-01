@@ -61,8 +61,8 @@ export class ChunkQueue {
 }
 
 export class InterviewCapture {
-  constructor({sessionId, nextSeq = 0, upload, openConnection, closeConnection, mediaDevices = globalThis.navigator?.mediaDevices, Recorder = globalThis.MediaRecorder, Peer = globalThis.RTCPeerConnection, hash, onState = () => {}, onError = () => {}, onEvent = () => {}, onAck = () => {}, onRemote = () => {}, segmentMs = 3000, timeoutMs = 12000}) {
-    Object.assign(this, {sessionId, openConnection, closeConnection, mediaDevices, Recorder, Peer, onState, onError, onEvent, onRemote, segmentMs});
+  constructor({sessionId, nextSeq = 0, upload, openConnection, closeConnection, mediaDevices = globalThis.navigator?.mediaDevices, Recorder = globalThis.MediaRecorder, Peer = globalThis.RTCPeerConnection, hash, onState = () => {}, onError = () => {}, onEvent = () => {}, onAck = () => {}, onRemote = () => {}, segmentMs = 3000, timeoutMs = 12000, disconnectGraceMs = 5000}) {
+    Object.assign(this, {sessionId, openConnection, closeConnection, mediaDevices, Recorder, Peer, onState, onError, onEvent, onRemote, segmentMs, disconnectGraceMs});
     this.state = "paused";
     this.epoch = 0;
     this.recording = false;
@@ -92,7 +92,10 @@ export class InterviewCapture {
       this.setState("connecting");
       let stream;
       try {
-        stream = await this.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false}, video: false});
+        // This is a live conversation: speaker playback must not re-enter VAD
+        // and cancel the interviewer or contaminate the contributor recording.
+        // Keep gain control off to avoid amplifying room noise between answers.
+        stream = await this.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false}, video: false});
         if (epoch !== this.epoch) { stream.getTracks().forEach((track) => track.stop()); return false; }
         this.stream = stream;
         const pc = new this.Peer();
@@ -110,7 +113,21 @@ export class InterviewCapture {
         dc.onopen = () => { if (epoch === this.epoch) Promise.resolve().then(() => this.onEvent({type: "raneen.connected"}, this)).catch((error) => this.onError(error)); };
         dc.onerror = () => { if (epoch === this.epoch) this.pause().then(() => this.onError(new Error("connection_lost"))).catch(this.onError); };
         pc.onconnectionstatechange = () => {
-          if (epoch === this.epoch && ["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+          if (epoch !== this.epoch) return;
+          if (pc.connectionState === "disconnected") {
+            // A transient ICE disruption can recover on this same connection.
+            // Keep bounded audio capture running without creating another call.
+            this.disconnectTimer ??= setTimeout(() => {
+              this.disconnectTimer = null;
+              if (epoch === this.epoch && pc.connectionState === "disconnected") {
+                this.pause().then(() => this.onError(new Error("connection_lost"))).catch(this.onError);
+              }
+            }, this.disconnectGraceMs);
+            return;
+          }
+          clearTimeout(this.disconnectTimer);
+          this.disconnectTimer = null;
+          if (["failed", "closed"].includes(pc.connectionState)) {
             this.pause().then(() => this.onError(new Error("connection_lost"))).catch(this.onError);
           }
         };
@@ -208,6 +225,8 @@ export class InterviewCapture {
     ++this.epoch;
     this.recording = false;
     clearTimeout(this.timer);
+    clearTimeout(this.disconnectTimer);
+    this.disconnectTimer = null;
     const final = this.finalChunk;
     if (this.recorder?.state === "recording") {
       try { this.recorder.stop(); }
