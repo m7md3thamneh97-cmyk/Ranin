@@ -40,6 +40,28 @@ test('provider and invalid synthesized-audio failures never request more contrib
   assert.equal(workflowFailure({detail:{code:'voice_clone_failed',message:'Speech provider rejected audio'}},t,'creatingVoice'),copy.en.cloneFailed);
 });
 
+test('provider rejection reasons are actionable in both languages without showing raw service messages', () => {
+  const reasons={auth:'voiceKeyRejected',permission:'voicePermissionDenied',plan:'voicePlanRequired',quota:'voiceCreditsNeeded',voice_limit:'voiceLimitReached',request_validation:'voiceRequestRejected',rate_limit:'voiceRateLimited'};
+  for(const lang of ['en','ar']){
+    const t=key=>copy[lang][key];
+    for(const [reason,key] of Object.entries(reasons)){
+      for(const code of ['voice_clone_failed','voice_preview_failed']){
+        const text=workflowFailure({detail:{code,message:'private-provider-detail',details:{reason,http_status:403,attempts:1,attempt_limit:3}}},t);
+        assert.equal(text,copy[lang][key]);
+        assert.ok(!text.includes('private-provider-detail'));
+        assert.notEqual(text,copy[lang].moreSpeech);
+      }
+    }
+    const capped=workflowFailure({detail:{code:'voice_clone_failed',details:{reason:'auth',attempts:3,attempt_limit:3}}},t);
+    assert.equal(capped,copy[lang].voiceKeyRejected+' '+copy[lang].cloneRetryLimit);
+    assert.equal(workflowFailure({detail:{code:'clone_retry_limit'}},t),copy[lang].cloneRetryLimit);
+    assert.equal(workflowFailure({detail:{code:'preview_retry_limit'}},t),copy[lang].sampleRetryLimit);
+    assert.equal(workflowFailure({detail:{code:'voice_preview_retry_limit'}},t),copy[lang].sampleRetryLimit);
+    const unknown=workflowFailure({detail:{code:'outcome_unknown',details:{reason:'auth'}}},t);
+    assert.equal(unknown,copy[lang].outcomePending);
+  }
+});
+
 test('missing decoder, corrupt saved audio and preparation timeout are distinct from shortfall', () => {
   const t=key=>copy.en[key];
   assert.equal(workflowFailure({detail:{code:'decoder_unavailable'}},t),copy.en.audioCheckUnavailable);
