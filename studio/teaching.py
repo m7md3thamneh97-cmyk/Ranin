@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal
 import httpx
 from fastapi import Depends, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.routing import APIRoute
 from pydantic import Field
 from .app import StrictModel, now, token_hash, uid
@@ -323,5 +323,10 @@ def install(app):
     @app.get('/advanced', include_in_schema=False)
     def advanced():
         return FileResponse(static / 'index.html')
-    # Preserve the old interface at /advanced, while keeping all existing API guards.
-    app.router.routes.insert(0, APIRoute('/', lambda: FileResponse(static / 'guided.html'), methods=['GET'], include_in_schema=False))
+    def teaching_home():
+        if os.environ.get('RANEEN_PLATFORM_HOME', '0').strip() == '1':
+            return RedirectResponse('/enroll', status_code=307)
+        return FileResponse(static / 'guided.html')
+
+    # This route takes precedence over the foundation home route in the composed app.
+    app.router.routes.insert(0, APIRoute('/', teaching_home, methods=['GET'], include_in_schema=False))
