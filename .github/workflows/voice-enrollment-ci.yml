@@ -38,6 +38,7 @@ jobs:
           Acquire::https::Timeout "20";
           APT
           if ! command -v ffmpeg >/dev/null; then
+            sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/sources.list.d/ubuntu.sources
             sudo apt-get update
             sudo apt-get install --yes ffmpeg
           fi
