@@ -2,6 +2,24 @@
 
 Private, owner-only staging prototype for collecting demonstrated judgment, dialect, wording, accent and delivery. This is a collection/review application, **not a trained replica**.
 
+## Platform build in progress
+
+The current development line builds on `work/voice-enrollment-v1`, with a guided
+Arabic/English owner journey at `/enroll`. The first platform increment focuses
+on clear consent, a local microphone check, a spoken interview, saved-session
+recovery, and explicit handling of unsaved audio. Authentication still uses the
+temporary private owner credential. Employee accounts are a later milestone.
+
+Read [the platform build plan](docs/PLATFORM_BUILD_PLAN.md) for the ordered
+engineering work and acceptance gates. Provider adapters exist, but real voice
+quality and the full personalized-agent flow have not been accepted. The new
+guided interface keeps agent preparation and preview unavailable until the
+remaining audio, consent, job, and spending-control gates pass. Provider
+integrations remain off by default. This branch is not a deployment.
+
+The Render and legacy collection notes below describe the earlier hosting
+baseline. They are not an acceptance record for the new enrollment platform.
+
 ## Render staging
 
 The `deploy/render-staging` branch contains the Render migration. The Railway-linked `main` branch is unchanged. **A committed Blueprint is not a live deployment.**
@@ -31,6 +49,7 @@ python -m venv .venv
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 node tests/wav_encoder.mjs
+node tests/enrollment_capture.mjs
 python run.py
 ```
 

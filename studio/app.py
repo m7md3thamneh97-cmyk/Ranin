@@ -8,8 +8,10 @@ import json
 import math
 import os
 import secrets
+import shutil
 import sqlite3
 import sys
+import tempfile
 import uuid
 import wave
 import zipfile
@@ -19,7 +21,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -254,7 +256,20 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Cache-Control'] = 'no-store'
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        if request.url.path == '/vapi-frame':
+            response.headers['Content-Security-Policy'] = ("default-src 'none'; script-src 'self' "
+                "https://c.daily.co/call-machine/versioned/0.87.0/static/call-machine-object-bundle.js; "
+                "style-src 'self' 'unsafe-inline'; connect-src 'self' https://*.daily.co wss://*.daily.co; "
+                "media-src 'self' blob: https://*.daily.co; worker-src 'self' blob:; "
+                "frame-src https://*.daily.co; img-src data:; object-src 'none'; "
+                "frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
+        elif request.url.path == '/enroll':
+            response.headers['Content-Security-Policy'] = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; "
+                "frame-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; "
+                "base-uri 'self'; form-action 'self'")
+        else:
+            response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         response.headers['Permissions-Policy'] = 'microphone=(self), camera=(), geolocation=()'
         return response
 
@@ -293,6 +308,26 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
     def healthz():
         store.one('SELECT 1 AS ok')
         return dict(status='ok')
+
+    @app.get('/readyz', include_in_schema=False)
+    def readiness():
+        """Public deployment diagnostics: configuration presence, never credentials/data."""
+        revision = os.environ.get('RENDER_GIT_COMMIT', '')
+        if len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
+            revision = None
+        return {
+            'application': 'raneen-owner-platform',
+            'revision': revision,
+            'enrollment_enabled': os.environ.get('RANEEN_VOICE_ENROLLMENT_ENABLED', '0').strip() == '1',
+            'providers_configured': {
+                'openai': bool(os.environ.get('OPENAI_API_KEY', '').strip()),
+                'elevenlabs': bool(os.environ.get('ELEVENLABS_API_KEY', '').strip()),
+                'vapi': bool(os.environ.get('VAPI_API_KEY', '').strip()),
+            },
+            'audio_decoder_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe')),
+            'storage_available': shutil.disk_usage(store.root).free >= 256 * 1024 * 1024,
+            'provider_access_verified': False,
+        }
 
     @app.get('/api/me')
     def me(user=Depends(actor)):
@@ -382,12 +417,34 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             raise HTTPException(422, 'Invalid capture settings.')
         audio_id = uid()
         path = store.audio_dir / f'{audio_id}.wav'
-        path.write_bytes(data)
+        fd, temp_name = tempfile.mkstemp(prefix='audio-', suffix='.tmp', dir=store.audio_dir)
+        os.close(fd)
+        temp_path = Path(temp_name)
+        temp_path.write_bytes(data)
+        finalized = False
         try:
-            store.execute('INSERT INTO audio VALUES(?,?,?,?,?,?,?)', (audio_id, ident, consent['id'], hashlib.sha256(data).hexdigest(), json.dumps(stats), json.dumps(parsed), now()))
+            # Finalization and consent validation share one write transaction. A
+            # withdrawal that commits first rejects this upload; if this transaction
+            # commits first, the recording was accepted while consent was still active.
+            with store.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                fresh = db.execute(
+                    'SELECT collection,withdrawn_at FROM consents WHERE id=? AND profile_id=?',
+                    (consent['id'], ident)).fetchone()
+                if not fresh or not fresh['collection'] or fresh['withdrawn_at']:
+                    raise HTTPException(409, 'Consent was withdrawn before this recording finalized.')
+                os.replace(temp_path, path)
+                finalized = True
+                db.execute(
+                    'INSERT INTO audio VALUES(?,?,?,?,?,?,?)',
+                    (audio_id, ident, consent['id'], hashlib.sha256(data).hexdigest(),
+                     json.dumps(stats), json.dumps(parsed), now()))
         except Exception:
-            path.unlink(missing_ok=True)
+            if finalized:
+                path.unlink(missing_ok=True)
             raise
+        finally:
+            temp_path.unlink(missing_ok=True)
         store.audit(user['id'], 'upload_audio', audio_id)
         return dict(id=audio_id, stats=stats)
 
@@ -530,6 +587,12 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
 
     @app.get('/')
     def index():
+        if os.environ.get('RANEEN_PLATFORM_HOME', '0').strip() == '1':
+            return RedirectResponse('/enroll', status_code=307)
+        return FileResponse(static / 'index.html')
+
+    @app.get('/studio', include_in_schema=False)
+    def legacy_studio():
         return FileResponse(static / 'index.html')
 
     return app
