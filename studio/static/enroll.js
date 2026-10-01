@@ -1,5 +1,6 @@
 import {InterviewCapture} from './enrollment-capture.js';
 import {copy} from './enrollment-copy.js';
+import {workflowFailure as explainWorkflowFailure} from './enrollment-errors.js';
 // Retire the earlier enrollment credential cache. This flow keeps access in memory.
 try { sessionStorage.removeItem('raneen-token'); } catch {}
 const q=(s)=>document.querySelector(s), app=q('#app');
@@ -202,14 +203,7 @@ function workflowMessage(w){
 }
 async function fetchWorkflow(){const id=S.session;const w=await request('/api/enrollment/sessions/'+encodeURIComponent(id)+'/workflow');if(id!==S.session)return null;S.workflow=w;return w;}
 function workflowFailure(e){
-  const detail=String(e.detail||'').toLowerCase();
-  if(e.message==='request_timeout')return t('operationTimeout');
-  if(detail.includes('confirmed')||detail.includes('evidence'))return t('noExamples');
-  if(detail.includes('speech')||detail.includes('audio')||detail.includes('sample')||detail.includes('decode'))return t('moreSpeech');
-  if(detail.includes('verification'))return t('verificationPending');
-  if(detail.includes('unknown')||detail.includes('dispatching')||detail.includes('reconcile'))return t('outcomePending');
-  if(e.status===503)return t('notConfigured');
-  return explain(e);
+  return explainWorkflowFailure(e,t,S.phase);
 }
 async function finishInterview(){
   if(S.busy||S.resuming)return;

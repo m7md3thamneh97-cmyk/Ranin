@@ -3,8 +3,46 @@
 import test, {afterEach} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
+import {workflowFailure} from '../studio/static/enrollment-errors.js';
+import {copy} from '../studio/static/enrollment-copy.js';
 
 const {ChunkQueue, InterviewCapture} = await import('../studio/static/enrollment-capture.js');
+
+test('voice preparation shows measured audible shortfall while preserving the saved-recording explanation', () => {
+  const error={detail:{code:'insufficient_audio',message:'Need more audio',details:{selected_active_ms:49000,minimum_active_ms:60000,decoded_source_ms:123000}}};
+  for(const lang of ['en','ar']){
+    const text=workflowFailure(error,key=>copy[lang][key],'creatingVoice');
+    assert.ok(text.includes('49')&&text.includes('60'));
+    assert.ok(!text.includes('{seconds}')&&!text.includes('{minimum}'));
+    assert.notEqual(text,copy[lang].noExamples);
+  }
+});
+
+test('provider and invalid synthesized-audio failures never request more contributor speech', () => {
+  const t=key=>copy.en[key];
+  for(const code of ['voice_preview_failed','invalid_voice_preview','preview_operation_failed']){
+    assert.equal(workflowFailure({detail:{code,message:'Audio sample decoding failed'}},t,'makingSamples'),copy.en.sampleFailed);
+  }
+  assert.equal(workflowFailure({detail:'Generated audio could not be decoded'},t,'makingSamples'),copy.en.sampleFailed);
+  assert.equal(workflowFailure({message:'empty_preview'},t,'makingSamples'),copy.en.sampleFailed);
+  assert.equal(workflowFailure({detail:{code:'voice_clone_failed',message:'Speech provider rejected audio'}},t,'creatingVoice'),copy.en.cloneFailed);
+});
+
+test('missing decoder, corrupt saved audio and preparation timeout are distinct from shortfall', () => {
+  const t=key=>copy.en[key];
+  assert.equal(workflowFailure({detail:{code:'decoder_unavailable'}},t),copy.en.audioCheckUnavailable);
+  assert.equal(workflowFailure({detail:{code:'invalid_audio'}},t),copy.en.audioReadFailed);
+  assert.equal(workflowFailure({detail:{code:'audio_prepare_timeout'}},t),copy.en.audioCheckTimeout);
+  assert.equal(workflowFailure({detail:{code:'audio_sequence_gap'}},t),copy.en.saveFirst);
+  assert.equal(workflowFailure({detail:{code:'insufficient_audio',details:{decoded_source_ms:0,rejected_reasons:{invalid_audio:20}}}},t),copy.en.audioReadFailed);
+});
+
+test('uncertain provider operations and verified response evidence keep their own recovery paths', () => {
+  const t=key=>copy.en[key];
+  assert.equal(workflowFailure({detail:{code:'outcome_unknown',message:'Audio request timed out'}},t,'creatingVoice'),copy.en.outcomePending);
+  assert.equal(workflowFailure({detail:'Confirmed evidence is required'},t,'buildingAgent'),copy.en.noExamples);
+  assert.equal(workflowFailure({detail:'Need more clear contributor audio before preparing the voice'},t,'creatingVoice'),copy.en.moreSpeech);
+});
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
