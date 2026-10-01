@@ -29,7 +29,14 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Install audio validation dependency
+        timeout-minutes: 3
         run: |
+          # Keep transient package mirrors from stalling the validation job.
+          sudo tee /etc/apt/apt.conf.d/99-raneen-ci-timeouts > /dev/null <<'APT'
+          Acquire::Retries "0";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          APT
           if ! command -v ffmpeg >/dev/null; then
             sudo apt-get update
             sudo apt-get install --yes ffmpeg
@@ -52,6 +59,7 @@ jobs:
           for module in studio/static/conversation-*.js studio/static/learning-api.js; do node --input-type=module --check < "$module"; done
           node --input-type=module --check < studio/static/tester-access-ui.js
       - name: Install synthetic browser test dependencies
+        timeout-minutes: 4
         run: |
           python -m pip install -r requirements-browser.txt
           python -m playwright install --with-deps chromium --only-shell
