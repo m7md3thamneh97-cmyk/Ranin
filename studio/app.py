@@ -133,6 +133,8 @@ class Store:
         self.db_path = self.root / 'studio.sqlite3'
         with self.db() as db:
             db.executescript(SCHEMA)
+        from .migrations import migrate
+        migrate(self)
 
     @contextlib.contextmanager
     def db(self):
@@ -216,7 +218,7 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
         public_host = parsed.hostname
         public_origin = 'https://' + public_host
     store = Store(Path(data_dir or os.environ.get('RANEEN_DATA_DIR', './data')))
-    app = FastAPI(title='Raneen Teaching Studio', version='0.1.0', docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title='Raneen Teaching Studio', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
     # No wildcard hosts; Railway's probe hostname is restricted to /healthz below.
     allowed_hosts = [public_host, 'healthcheck.railway.app'] if public_host else ['localhost', '127.0.0.1', '[::1]', 'testserver']
@@ -230,13 +232,39 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             if request.headers.get('host', '') == 'healthcheck.railway.app' and request.url.path != '/healthz':
                 return Response('Not found.', status_code=404)
             # Validate before FastAPI reads an API request body. Never put credentials in URLs.
-            if request.url.path.startswith('/api/'):
+            if request.url.path.startswith('/api/') and not request.url.path.startswith('/api/providers/vapi/'):
                 credential = request.headers.get('authorization', '')
                 account = store.one('SELECT id,role FROM users WHERE token_hash=?', (token_hash(credential[7:]),)) if credential.startswith('Bearer ') and len(credential) <= 520 else None
                 if not account:
                     return Response('Authentication required.', status_code=401, headers={'Cache-Control': 'no-store'})
                 if owner_only and (account['role'] != 'admin' or (request.url.path == '/api/users' and request.method == 'POST')):
                     return Response('Owner-only staging. Employee access is not enabled.', status_code=403, headers={'Cache-Control': 'no-store'})
+        if request.method in ('POST','PUT','PATCH','DELETE'):
+            # Provider-side evidence cannot be forged through legacy text APIs.
+            parts=request.url.path.strip('/').split('/')
+            target=None
+            if len(parts)>=3 and parts[1]=='profiles':
+                target=parts[2]
+            elif len(parts)>=3 and parts[1] in ('sessions','turns','hypotheses','simulations','examples','preferences','learning-jobs'):
+                table={'sessions':'teaching_sessions','turns':'conversation_turns','hypotheses':'hypotheses','simulations':'simulation_runs','examples':'examples','preferences':'preferences','learning-jobs':'learning_jobs'}[parts[1]]
+                row=store.one(f'SELECT profile_id FROM {table} WHERE id=?',(parts[2],))
+                target=row['profile_id'] if row else None
+            elif len(parts)>=3 and parts[1]=='voice':
+                table='voice_samples' if parts[2]=='samples' else 'voice_versions'
+                ident=parts[3] if table=='voice_samples' and len(parts)>=4 else parts[2]
+                row=store.one(f'SELECT profile_id FROM {table} WHERE id=?',(ident,))
+                target=row['profile_id'] if row else None
+            if target:
+                from .backend import enrollment_binding
+                if enrollment_binding(store,target):
+                    credential=request.headers.get('authorization','')
+                    account=store.one('SELECT id FROM users WHERE token_hash=?',(token_hash(credential[7:]),)) if credential.startswith('Bearer ') and len(credential)<=520 else None
+                    if not account:
+                        return Response('Authentication required.',status_code=401,headers={'Cache-Control':'no-store'})
+                    owner=store.one('SELECT owner_id FROM profiles WHERE id=?',(target,))
+                    if not owner or owner['owner_id']!=account['id']:
+                        return Response('Enrollment learning is owner-only.',status_code=403,headers={'Cache-Control':'no-store'})
+                    return Response(json.dumps({'detail':'Enrollment evidence is changed only through its trusted voice workflow.'}),status_code=409,media_type='application/json',headers={'Cache-Control':'no-store'})
         max_size = MAX_AUDIO if '/audio' in request.url.path else MAX_JSON
         if request.method == 'PUT' and re.fullmatch(r'/api/enrollment/sessions/[0-9a-f]{32}/chunks/[0-9]{1,5}', request.url.path):
             from .enrollment import CHUNK_MAX
@@ -296,6 +324,10 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             raise HTTPException(404, 'Profile not found.')
         if profile['owner_id'] != user['id'] and (owner_only or user['role'] != 'admin'):
             raise HTTPException(403, 'This profile belongs to another contributor.')
+        from .backend import enrollment_binding
+        if enrollment_binding(store,ident):
+            from .enrollment_learning import check_enrollment_binding
+            check_enrollment_binding(store,ident,user['id'])
         return profile
 
     def current_consent(profile_id):
@@ -354,6 +386,8 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
     @app.get('/api/profiles')
     def profiles(user=Depends(actor)):
         items = store.all('SELECT * FROM profiles' + ('' if user['role'] == 'admin' else ' WHERE owner_id=?') + ' ORDER BY created', () if user['role'] == 'admin' else (user['id'],))
+        private_ids={row['profile_id'] for row in store.all('SELECT profile_id FROM enrollment_learning_bindings')}
+        items=[item for item in items if item['owner_id']==user['id'] or item['id'] not in private_ids]
         for item in items:
             item['consent'] = store.one('SELECT id,version,collection,behavior_export,voice_export,withdrawn_at FROM consents WHERE profile_id=? ORDER BY rowid DESC LIMIT 1', (item['id'],))
         return dict(items=items)
@@ -378,22 +412,37 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
     @app.post('/api/profiles/{ident}/withdraw')
     def withdraw(ident: str, user=Depends(actor)):
         get_profile(ident, user, owner_only=True)
-        store.execute('UPDATE consents SET withdrawn_at=? WHERE profile_id=? AND withdrawn_at IS NULL', (now(), ident))
+        with store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('UPDATE consents SET withdrawn_at=? WHERE profile_id=? AND withdrawn_at IS NULL', (now(), ident))
+            db.execute('UPDATE provider_authorizations SET withdrawn_at=? WHERE profile_id=? AND withdrawn_at IS NULL', (now(), ident))
+            db.execute("UPDATE teaching_sessions SET status='ended',ended_at=? WHERE profile_id=? AND status='active'",(now(),ident))
         store.audit(user['id'], 'withdraw_consent', ident)
-        return dict(status='withdrawn', note='New collection and exports are blocked. Previously downloaded copies and external models are not automatically recalled.')
+        transport_cleanup=app.state.transport_registry.cleanup(ident)
+        return dict(status='withdrawn', external_transport_cleanup=transport_cleanup, note='New collection and exports are blocked. Previously downloaded copies and external models are not automatically recalled.')
 
     @app.delete('/api/profiles/{ident}')
     def delete_profile(ident: str, user=Depends(actor)):
         get_profile(ident, user, owner_only=True)
         audio_rows = store.all('SELECT id FROM audio WHERE profile_id=?', (ident,))
+        external_cleanup=app.state.voice.delete_external_for_profile(ident)
+        transport_cleanup=app.state.transport_registry.cleanup(ident)
+        app.state.voice.delete_local_previews(ident)
         with store.db() as db:
+            # New learning tables cascade from profiles. Clear them first so their
+            # immutable evidence references never block deletion of source consent.
+            for table in ('evaluation_runs','simulation_runs','agent_profile_versions','corrections','hypothesis_observations','hypotheses','learning_analyses','learning_jobs','observations','voice_versions','voice_samples','turn_audio_attachments','provider_authorizations','teaching_sessions'):
+                if table == 'hypothesis_observations':
+                    db.execute('DELETE FROM hypothesis_observations WHERE hypothesis_id IN (SELECT id FROM hypotheses WHERE profile_id=?)',(ident,))
+                else:
+                    db.execute(f'DELETE FROM {table} WHERE profile_id=?',(ident,))
             for table in ('examples', 'preferences', 'audio', 'consents'):
                 db.execute(f'DELETE FROM {table} WHERE profile_id=?', (ident,))
             db.execute('DELETE FROM profiles WHERE id=?', (ident,))
         for row in audio_rows:
             (store.audio_dir / f"{row['id']}.wav").unlink(missing_ok=True)
         store.audit(user['id'], 'delete_local_profile', ident)
-        return dict(status='deleted_locally', note='External exports, device backups and filesystem remnants require separate handling.')
+        return dict(status='deleted_locally', external_voice_cleanup=external_cleanup, external_transport_cleanup=transport_cleanup, note='External exports, device backups and filesystem remnants require separate handling.')
 
     @app.post('/api/profiles/{ident}/audio', status_code=201)
     async def upload_audio(ident: str, request: Request, user=Depends(actor)):
@@ -462,10 +511,15 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             profile = store.one('SELECT owner_id FROM profiles WHERE id=?', (row['profile_id'],))
             if profile['owner_id'] != user['id']:
                 current_consent(row['profile_id'])
+                source=store.one('SELECT collection,withdrawn_at FROM consents WHERE id=?',(row['consent_id'],))
+                if not source or not source['collection'] or source['withdrawn_at']:
+                    raise HTTPException(409,'Recording source consent is withdrawn.')
         return FileResponse(store.audio_dir / f'{ident}.wav', media_type='audio/wav')
 
     @app.post('/api/examples', status_code=201)
     def create_example(body: Example, user=Depends(actor)):
+        from .backend import reject_legacy_write
+        reject_legacy_write(store,body.profile_id)
         get_profile(body.profile_id, user, owner_only=True)
         consent = current_consent(body.profile_id)
         if body.scenario_id not in BY_ID:
@@ -474,6 +528,9 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             audio = store.one('SELECT * FROM audio WHERE id=? AND profile_id=?', (body.audio_id, body.profile_id))
             if not audio:
                 raise HTTPException(422, 'Recording does not belong to this profile.')
+            from .backend import require_audio_partition
+            with store.db() as db:
+                require_audio_partition(db,audio['sha256'],BY_ID[body.scenario_id]['split'])
             # Never attach the same audio identity to multiple demonstrations.
             # This also prevents exact-audio leakage between training and holdout.
             for previous in store.all('SELECT payload FROM examples WHERE profile_id=?', (body.profile_id,)):
@@ -489,6 +546,8 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
 
     @app.post('/api/preferences', status_code=201)
     def create_preference(body: Preference, user=Depends(actor)):
+        from .backend import reject_legacy_write
+        reject_legacy_write(store,body.profile_id)
         get_profile(body.profile_id, user, owner_only=True)
         consent = current_consent(body.profile_id)
         if body.scenario_id not in BY_ID:
@@ -506,6 +565,9 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
         result = {}
         for table in ('examples', 'preferences'):
             rows = store.all(f'SELECT * FROM {table} WHERE profile_id=? ORDER BY created DESC', (profile_id,))
+            if profile['owner_id'] != user['id']:
+                from .backend import consent_active
+                rows=[r for r in rows if consent_active(store,r['consent_id'])]
             for row in rows:
                 row['payload'] = json.loads(row['payload'])
                 row['split'] = BY_ID[row['payload']['scenario_id']]['split']
@@ -585,6 +647,9 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
                             written.add(v['audio_id'])
         store.audit(user['id'], 'dataset_export', profile_id, dict(export_id=export_id, kind=kind, counts=manifest['counts']))
         return Response(output.getvalue(), media_type='application/zip', headers={'Content-Disposition': f'attachment; filename="raneen-{kind}-{export_id[:8]}.zip"'})
+
+    from .backend import install_backend
+    install_backend(app, store, actor, get_profile, current_consent)
 
     static = Path(__file__).parent / 'static'
     app.mount('/static', StaticFiles(directory=static), name='static')

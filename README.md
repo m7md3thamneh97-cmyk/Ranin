@@ -1,64 +1,46 @@
-# Raneen Teaching Studio
+# Raneen
 
-Private, owner-only staging prototype for collecting demonstrated judgment, dialect, wording, accent and delivery. This is a collection/review application, **not a trained replica**.
+An owner-only voice teaching studio with an Arabic/English conversation interface, trusted spoken evidence, versioned learning, practice/correction/retry, and a private personalized voice preview. The application retains FastAPI, browser JavaScript, SQLite and the existing Render/Docker launchers.
 
-## Platform build in progress
+This development branch composes `work/conversation-studio-frontend` with the learning backend. It preserves the existing enrollment, isolated microphone chunks, provider recovery, and private Vapi call flow. It is a review branch; it has not been deployed or accepted in a real Arabic microphone conversation.
 
-The current development line builds on `work/voice-enrollment-v1`, with a guided
-Arabic/English owner journey at `/enroll`. The first platform increment focuses
-on clear consent, a local microphone check, a spoken interview, saved-session
-recovery, and explicit handling of unsaved audio. Authentication still uses the
-temporary private owner credential. Employee accounts are a later milestone.
-
-Read [the platform build plan](docs/PLATFORM_BUILD_PLAN.md) for the ordered
-engineering work and acceptance gates. Provider adapters exist, but real voice
-quality and the full personalized-agent flow have not been accepted. The new
-guided interface keeps agent preparation and preview unavailable until the
-remaining audio, consent, job, and spending-control gates pass. Provider
-integrations remain off by default. This branch is not a deployment.
-
-The Render and legacy collection notes below describe the earlier hosting
-baseline. They are not an acceptance record for the new enrollment platform.
-
-## Render staging
-
-The `deploy/render-staging` branch contains the Render migration. The Railway-linked `main` branch is unchanged. **A committed Blueprint is not a live deployment.**
-
-[Deploy the configured staging app to Render](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2Fm7md3thamneh97-cmyk%2FRanin%2Ftree%2Fdeploy%2Frender-staging)
-
-The button opens Render's authenticated review/provisioning flow; it is not the app URL. Use it once, or use the connected Render operator tools, not both. Review existing services before creating anything. Your Render account must have GitHub access to this private repository. Keep repository access scoped to `Ranin`.
-
-`render.yaml` declares one Docker web service in Frankfurt, one 1 GB persistent disk at `/var/data`, port 8080, `/healthz`, and a Render-generated owner credential. Automatic deployments and previews are off. The intended baseline is $7/month compute plus $0.25/month disk, excluding taxes and additional usage. No paid workspace upgrade is needed for this configuration. The legacy `starter` compute identifier corresponds to `0.5c-512mb`.
-
-The owner signs in with `RANEEN_ADMIN_TOKEN` from Render's Environment panel. Never put it in Git, a URL, logs, browser source or chat. Render provides `RENDER_EXTERNAL_URL`; the app uses that exact HTTPS origin. Startup refuses an unmounted data path, an invalid origin, or an invalid owner-secret format. See [deployment and test record](docs/RENDER_DEPLOYMENT.md).
-
-## Available
-
-- Sixteen authored situations with recorded or typed responses, decision cues, alternatives and change conditions.
-- Consent-scoped profiles, mono PCM WAV, manually verified transcripts and basic signal checks.
-- Human review, comparison coaching, separate behavior/voice exports and held-out scenario families.
-- Owner-only hosted authentication and private audio access; no external AI provider calls.
-
-AI interviewing, automatic transcription, voice cloning, model adaptation and Vapi integration are **not connected**. Hosted employee access remains blocked. Test only with fictional scenarios and the owner's own material; do not collect production employee or customer recordings.
-
-## Local use and tests
+## Run locally
 
 ```sh
 python -m venv .venv
 # Activate the virtual environment for your operating system.
 python -m pip install -r requirements-dev.txt
-python -m pytest -q
-node tests/wav_encoder.mjs
-node tests/enrollment_capture.mjs
 python run.py
 ```
 
-`run.py` is loopback-only at localhost:8765 and prints a newly generated local admin token on first launch. Hosted containers run `serve.py` through the existing Docker entrypoint, drop root privileges before serving HTTP, and do not print the owner credential.
+Open localhost:8765. The launcher creates a local owner credential on first launch. Hosted containers use `serve.py` and hosting secret storage. `/enroll` is the guided conversation; `/studio` retains the evidence/review interface.
 
-Migration verification: 89 backend/staging tests and the WAV encoder passed locally. Offline browser/API integration passed using the smoke helper in the original staging archive. The live browser microphone test was blocked by this execution environment. Docker building and hosted persistence have not yet been verified on Render.
+Both provider feature flags default to zero: `RANEEN_VOICE_ENROLLMENT_ENABLED` controls enrollment and `RANEEN_LEARNING_STUDIO_ENABLED` controls the new learning-provider adapters. Offline `local_rules` is a finite development engine. It demonstrates correction/version behavior without claiming general reasoning, voice cloning, or model weight training. Missing provider configuration never produces a Ready clone.
 
-## Storage and operational limits
+Operator setup and separately approved live acceptance: [Gate B operator guide](docs/GATE_B_OPERATOR.md). Configuration names without secrets: [.env.example](.env.example). Hosted employee access remains disabled. Use one server process and the existing persistent disk; this branch creates no hosting resources.
 
-SQLite and WAV files share the dedicated disk. Use exactly one process/instance. This small disk is for owner testing, not a production speech corpus. Persistence is not a substitute for a tested backup/restore procedure. Deleting local records cannot recall exports, provider copies or backups. A public login page is expected; recording and data APIs require the private credential.
+## Connected behavior
 
-Railway compatibility remains in `serve.py` for existing deployments: it recognizes the platform-provided `RAILWAY_VOLUME_MOUNT_PATH` and `RAILWAY_PUBLIC_DOMAIN`. This migration does not modify Railway resources or deploy this branch there.
+- Disclosed enrollment consent, resumable checksum-acknowledged microphone chunks and trusted provider-side transcript/confirmation evidence.
+- Stable server-side enrollment/learning binding; browser text submissions cannot impersonate trusted spoken evidence.
+- Structured observations, tentative hypotheses, explicit corrections, targeted next questions and immutable profile versions with source provenance.
+- Practice and retry using the current learned context, while original attempts and snapshots remain unchanged. Customer practice input is excluded from teaching evidence.
+- Provider voice verification, fresh private previews, explicit voice approval and behavior-only updates that reuse the approved clone.
+- Durable provider operations, uncertain-outcome reconciliation, revocation and scoped external cleanup. The composed app uses bounded server-created preview rooms and does not expose a reusable Vapi public key.
+
+No CRM, market feeds, production phone routing, employee rollout or psychological identity replication is included. Fictional business examples are separate from current business facts and higher-priority policy.
+
+## Verify
+
+```sh
+python -m pytest -q
+node tests/wav_encoder.mjs
+node tests/enrollment_capture.mjs
+node tests/conversation_events.mjs
+python tests/learning_backend_contract.py --backend-root .
+python -m compileall -q studio
+```
+
+For the synthetic browser journey, install `requirements-browser.txt`, run `python -m playwright install chromium --only-shell`, then `python tests/enrollment_dom.py`. The browser harness uses synthetic media and mocked providers. It does not establish physical microphone, live provider or Arabic listener acceptance.
+
+See [backend API](docs/BACKEND_API.md), [delivery evidence and limitations](docs/BACKEND_DELIVERY.md), [voice backend](docs/VOICE_BACKEND.md), and [provider contracts](docs/PROVIDERS.md). Schema upgrades are additive and checksummed. Backups and restoration still require operator verification before live use.
