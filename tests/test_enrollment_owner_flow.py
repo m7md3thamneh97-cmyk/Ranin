@@ -160,17 +160,27 @@ def test_chunk_between_old_and_new_size_limits_is_accepted(env, monkeypatch):
     with wave.open(output, 'wb') as sound:
         sound.setnchannels(1)
         sound.setsampwidth(2)
-        sound.setframerate(16000)
-        sound.writeframes(b''.join(struct.pack('<h', round(4000 * math.sin(2 * math.pi * 220 * index / 16000)))
-                                   for index in range(48000)))
+        sound.setframerate(24000)
+        sound.writeframes(b''.join(struct.pack('<h', round(4000 * math.sin(2 * math.pi * 220 * index / 24000)))
+                                   for index in range(72000)))
     audio = output.getvalue()
-    assert 80 * 1024 < len(audio) < 256 * 1024
+    assert 96 * 1024 < len(audio) < 256 * 1024
     headers = auth(owner) | {'Content-Type': 'audio/wav', 'X-Speaker-Role': 'contributor',
                             'X-Chunk-Sha256': hashlib.sha256(audio).hexdigest(), 'X-Duration-Ms': '3000'}
     response = client.put(f'/api/enrollment/sessions/{sid}/chunks/0', headers=headers, content=audio)
     assert response.status_code == 200 and response.json()['seq'] == 0
     stored = app.state.store.one('SELECT byte_count,sha256 FROM enrollment_chunks WHERE session_id=? AND seq=0', (sid,))
     assert stored['byte_count'] == len(audio) and stored['sha256'] == hashlib.sha256(audio).hexdigest()
+
+
+def test_larger_chunk_limit_does_not_increase_json_request_limit(env, monkeypatch):
+    client, app, owner, _, _ = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner) | {'Content-Type': 'application/json'},
+                           content=b' ' * (96 * 1024 + 1))
+    assert response.status_code == 413
+    assert not app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=?', (sid,))
 
 
 def test_chunk_above_256_kib_is_rejected_before_storage(env, monkeypatch):
@@ -407,3 +417,142 @@ def test_synthesis_provider_failure_is_not_audio_insufficiency(env, monkeypatch,
                         json={'approve': True, 'kind': 'question'})
     assert again.status_code == 409 and len(attempts) == 1
     assert again.json()['detail']['code'] == code
+
+
+def synthetic_three_second_wav(pattern):
+    """Real PCM with controlled energy; this is not a human speech fixture."""
+    rate = 16000
+    frames = bytearray()
+    for index in range(3 * rate):
+        window = index // (rate // 50)
+        active = pattern == 'dense' or (pattern == 'periodic' and (window % 8 < 3 or window == 149))
+        sample = round(5000 * math.sin(2 * math.pi * 220 * index / rate)) if active else 0
+        frames.extend(struct.pack('<h', sample))
+    output = io.BytesIO()
+    with wave.open(output, 'wb') as sound:
+        sound.setnchannels(1)
+        sound.setsampwidth(2)
+        sound.setframerate(rate)
+        sound.writeframes(frames)
+    return output.getvalue()
+
+
+def upload_synthetic_wav_chunks(client, owner, sid, pattern, count):
+    audio = synthetic_three_second_wav(pattern)
+    headers = auth(owner) | {'Content-Type': 'audio/wav', 'X-Speaker-Role': 'contributor',
+                            'X-Chunk-Sha256': hashlib.sha256(audio).hexdigest(), 'X-Duration-Ms': '3000'}
+    for seq in range(count):
+        response = client.put(f'/api/enrollment/sessions/{sid}/chunks/{seq}', headers=headers, content=audio)
+        assert response.status_code == 200
+
+
+def test_periodic_47_seconds_activity_in_123_seconds_recording_is_admitted(env, monkeypatch):
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    upload_synthetic_wav_chunks(client, owner, sid, 'periodic', 41)
+
+    quality = client.get(f'/api/enrollment/sessions/{sid}/quality', headers=auth(owner))
+    assert quality.status_code == 200
+    data = quality.json()
+    assert data['ready_for_clone'] is True and data['partial'] is False
+    assert data['selected_duration_ms'] == 123000
+    assert 47000 <= data['selected_active_ms'] < 48000
+    assert data['minimum_ms'] == data['minimum_sample_ms'] == 60000
+    assert data['minimum_active_ms'] == 30000
+    assert fake.clone_calls == 0
+    assert not app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=?', (sid,))
+
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                           json={'approve': True, 'final_seq': 40})
+    assert response.status_code == 200 and response.json()['state'] == 'sample_required'
+    assert fake.clone_calls == 1
+    version = app.state.store.one('SELECT sample_manifest FROM enrollment_voice_versions WHERE session_id=?', (sid,))
+    manifest = json.loads(version['sample_manifest'])
+    assert manifest['total_ms'] == data['selected_duration_ms']
+    assert manifest['active_ms'] == data['selected_active_ms']
+
+
+@pytest.mark.parametrize('pattern,count,reason', [
+    ('silence', 20, 'sample_and_activity'),
+    ('dense', 15, 'sample_duration'),
+])
+def test_quality_and_clone_reject_silence_or_short_sample_runtime(env, monkeypatch, pattern, count, reason):
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    upload_synthetic_wav_chunks(client, owner, sid, pattern, count)
+    quality = client.get(f'/api/enrollment/sessions/{sid}/quality', headers=auth(owner))
+    assert quality.status_code == 200
+    data = quality.json()
+    assert data['ready_for_clone'] is False and data['code'] == 'insufficient_audio'
+    assert data['partial'] is False and data['insufficiency'] == reason
+    if pattern == 'dense':
+        assert data['selected_active_ms'] >= 30000
+        assert data['selected_duration_ms'] == 45000
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                           json={'approve': True, 'final_seq': count - 1})
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == data['code']
+    assert response.json()['detail']['details'] == data['details']
+    assert fake.clone_calls == 0
+    assert not app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=?', (sid,))
+
+
+def test_partial_shortfall_is_incomplete_analysis_in_quality_and_clone(env, monkeypatch):
+    from studio.enrollment_audio import AudioValidationError
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    measured = {'saved_reported_ms': 1200000, 'captured_chunks': 400, 'inspected_chunks': 128,
+                'decoded_source_ms': 384000, 'decoded_active_ms': 25000,
+                'selected_duration_ms': 57000, 'selected_active_ms': 22000,
+                'minimum_sample_ms': 60000, 'minimum_active_ms': 30000,
+                'partial': True, 'rejected_chunks': 0, 'insufficiency': 'sample_and_activity'}
+
+    def incomplete(*args, **kwargs):
+        assert kwargs['min_sample_ms'] == 60000 and kwargs['min_active_ms'] == 30000
+        raise AudioValidationError('audio_analysis_incomplete', 'Saved audio remains outside this bounded analysis.', details=measured)
+
+    monkeypatch.setattr('studio.enrollment_audio.prepare_clone_sample', incomplete)
+    quality = client.get(f'/api/enrollment/sessions/{sid}/quality', headers=auth(owner))
+    assert quality.status_code == 200
+    data = quality.json()
+    assert data['ready_for_clone'] is False and data['partial'] is True
+    assert data['code'] == 'audio_analysis_incomplete' and data['details'] == measured
+    assert data['decoded_ms'] == measured['decoded_source_ms'] and data['active_ms'] == measured['decoded_active_ms']
+    response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
+                           json={'approve': True, 'final_seq': 0})
+    assert response.status_code == 409
+    assert response.json()['detail'] == {'code': data['code'], 'message': data['message'], 'details': measured}
+    assert fake.clone_calls == 0
+    assert not app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=?', (sid,))
+
+
+@pytest.mark.parametrize('revoke_during_analysis', [False, True])
+def test_quality_always_removes_normalized_sample_without_provider_side_effects(env, monkeypatch, tmp_path, revoke_during_analysis):
+    client, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(client, owner)
+    sample = tmp_path / 'sample-synthetic-private.wav'
+
+    def prepare(chunks, output_dir, **kwargs):
+        assert kwargs == {'min_sample_ms': 60000, 'min_active_ms': 30000, 'max_sample_ms': 125000, 'final_seq': -1}
+        sample.write_bytes(b'synthetic normalized fixture')
+        if revoke_during_analysis:
+            app.state.store.execute('UPDATE enrollment_sessions SET revoked_at=? WHERE id=?', (now(), sid))
+        return [{'seq': 0, 'path': str(sample), 'mime': 'audio/wav'}], {
+            'total_ms': 61000, 'active_ms': 31000,
+            'diagnostics': {'decoded_source_ms': 90000, 'decoded_active_ms': 40000,
+                            'selected_duration_ms': 61000, 'selected_active_ms': 31000,
+                            'inspected_chunks': 30, 'partial': True},
+        }
+
+    monkeypatch.setattr('studio.enrollment_audio.prepare_clone_sample', prepare)
+    response = client.get(f'/api/enrollment/sessions/{sid}/quality', headers=auth(owner))
+    assert response.status_code == (410 if revoke_during_analysis else 200)
+    if not revoke_during_analysis:
+        assert response.json()['ready_for_clone'] is True and response.json()['partial'] is True
+    assert not sample.exists()
+    assert fake.clone_calls == 0 and fake.speech_calls == [] and fake.vapi_calls == []
+    assert not app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=?', (sid,))

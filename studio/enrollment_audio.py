@@ -205,75 +205,108 @@ def build_capture_manifest(chunks: list[dict], *, final_seq: int) -> dict:
 
 
 def prepare_clone_sample(chunks: list[dict], output_dir: Path, *, min_active_ms: int = 60000,
-                         max_sample_ms: int = 125000, final_seq: int | None = None) -> tuple[list[dict], dict]:
-    """Return one private normalized WAV and a deterministic source manifest.
+                         max_sample_ms: int = 125000, final_seq: int | None = None,
+                         min_sample_ms: int | None = None) -> tuple[list[dict], dict]:
+    """Rank a bounded candidate set, then reproduce selected source spans.
 
-    The full capture is acknowledged before selection. Up to 128 source chunks
-    are decoded in spread order; RAM holds at most one source PCM plus 125 s of
-    mono 24 kHz output (~6 MB). Rejected chunks never enter the provider file.
+    At most 128 unique source chunks are inspected and at most 128 are decoded
+    again for assembly, within the same 60 s deadline. Only span metadata is
+    retained between passes; PCM buffers contain one source plus <=125 s output.
+    Runtime and energy activity are separate local heuristics, not measured
+    speech duration, speaker verification, or a provider quality guarantee.
     """
-    if not chunks:
-        raise AudioValidationError("insufficient_audio", "Record more contributor speech before preparing the voice.")
-    if not 1 <= min_active_ms <= max_sample_ms <= 125000:
+    min_sample_ms = min_active_ms if min_sample_ms is None else min_sample_ms
+    if not 1 <= min_active_ms <= min_sample_ms <= max_sample_ms <= 125000:
         raise AudioValidationError("invalid_audio_limits", "Audio preparation limits are invalid.")
     ordered = sorted(chunks, key=lambda item: item["seq"])
-    capture = build_capture_manifest(ordered, final_seq=ordered[-1]["seq"] if final_seq is None else final_seq)
-    # Equally spread candidates bound decoding work even for a long interview.
-    count = min(len(ordered), MAX_DECODE_CHUNKS)
-    indexes = sorted({round(index * (len(ordered) - 1) / max(1, count - 1)) for index in range(count)})
-    selected = []
-    rejected = []
-    joined = bytearray()
-    active_samples = 0
-    max_samples = SAMPLE_RATE * max_sample_ms // 1000
     inspected = 0
+    decoder_invocations = 0
     decoded_ms = 0
     decoded_active_ms = 0
+    rejected = []
     rejected_reasons = {}
+    joined = bytearray()
+    active_samples = 0
+    selected_samples = 0
     saved_reported_ms = sum(max(0, int(item.get("duration_ms", 0))) for item in ordered)
 
-    def diagnostics():
-        return {
+    def diagnostics(reason=None):
+        result = {
             "saved_reported_ms": saved_reported_ms, "captured_chunks": len(ordered),
-            "inspected_chunks": inspected, "decoded_source_ms": decoded_ms,
-            "decoded_active_ms": decoded_active_ms,
+            "inspected_chunks": inspected, "decoder_invocations": decoder_invocations,
+            "decoded_source_ms": decoded_ms, "decoded_active_ms": decoded_active_ms,
             "selected_active_ms": round(active_samples * 1000 / SAMPLE_RATE),
-            "selected_duration_ms": round(len(joined) * 1000 / (2 * SAMPLE_RATE)),
-            "minimum_active_ms": min_active_ms,
+            "selected_duration_ms": round(selected_samples * 1000 / SAMPLE_RATE),
+            "minimum_active_ms": min_active_ms, "minimum_sample_ms": min_sample_ms,
             "rejected_chunks": len(rejected), "rejected_reasons": dict(rejected_reasons),
             "partial": inspected < len(ordered),
         }
+        if reason:
+            result["insufficiency"] = reason
+        return result
+
+    def require_minimum():
+        low_runtime = selected_samples * 1000 < min_sample_ms * SAMPLE_RATE
+        low_activity = active_samples * 1000 < min_active_ms * SAMPLE_RATE
+        if not low_runtime and not low_activity:
+            return
+        reason = "sample_and_activity" if low_runtime and low_activity else "sample_duration" if low_runtime else "audible_activity"
+        partial = inspected < len(ordered)
+        message = (
+            "The bounded audio analysis could not select a sufficient sample; the rest of your saved recording has not been ruled out."
+            if partial else "The analyzed recording did not provide enough usable sample runtime and acoustic activity for this local quality check."
+        )
+        raise AudioValidationError("audio_analysis_incomplete" if partial else "insufficient_audio", message,
+                                   details=diagnostics(reason))
+
+    if not ordered:
+        require_minimum()
+    capture = build_capture_manifest(ordered, final_seq=ordered[-1]["seq"] if final_seq is None else final_seq)
+    count = min(len(ordered), MAX_DECODE_CHUNKS)
+    indexes = sorted({round(index * (len(ordered) - 1) / max(1, count - 1)) for index in range(count)})
+    deadline = time.monotonic() + PREPARE_TIMEOUT_SECONDS
+
+    def remaining_time():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AudioValidationError("audio_prepare_timeout", "Audio preparation took too long; your saved recording is still available.", details=diagnostics())
+        return remaining
 
     def reject(seq, reason):
         rejected.append({"seq": seq, "reason": reason})
         rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
 
-    deadline = time.monotonic() + PREPARE_TIMEOUT_SECONDS
+    def read_source(item):
+        data = _read_private_file(Path(item["path"]), CHUNK_MAX_BYTES)
+        if len(data) != item["byte_count"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
+            raise AudioValidationError("audio_checksum_mismatch", "Saved audio no longer matches its acknowledged checksum.")
+        return data
+
+    # Pass one holds source PCM only while measuring it. Do not fill the output
+    # in chronological first-fit order: later candidates may contain clearer
+    # material than the first 125 seconds encountered.
+    candidates = []
+    sources = {}
     for index in indexes:
-        if len(joined) // 2 >= max_samples:
-            break
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            raise AudioValidationError("audio_prepare_timeout", "Audio preparation took too long; your saved recording is still available.", details=diagnostics())
+        remaining_time()
         item = ordered[index]
         inspected += 1
         try:
-            data = _read_private_file(Path(item["path"]), CHUNK_MAX_BYTES)
-            if len(data) != item["byte_count"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
-                raise AudioValidationError("audio_checksum_mismatch", "Saved audio no longer matches its acknowledged checksum.")
-            pcm = _decode(data, item["mime"], 15000, timeout_seconds=remaining_seconds)
+            data = read_source(item)
+            budget = remaining_time()
+            decoder_invocations += 1
+            pcm = _decode(data, item["mime"], 15000, timeout_seconds=budget)
             source_metrics, active_windows = _analyze_pcm(pcm)
         except DecoderUnavailable:
             raise
         except AudioValidationError as exc:
+            if exc.code == "audio_prepare_timeout":
+                raise
             reject(item["seq"], exc.code)
             continue
+        remaining_time()
         decoded_ms += source_metrics["duration_ms"]
         decoded_active_ms += source_metrics["active_ms"]
-        # Reject damage in the ORIGINAL recording, even when it lies outside
-        # retained spans. A sparse but clear short utterance may become usable
-        # after removing long low-energy gaps; original activity ratio alone
-        # must not discard it.
         if source_metrics["clipped_samples"] > (len(pcm) // 2) * 0.005:
             reject(item["seq"], "clipped_audio")
             continue
@@ -285,56 +318,86 @@ def prepare_clone_sample(chunks: list[dict], output_dir: Path, *, min_active_ms:
         if not retained_metrics["usable_for_clone"]:
             reject(item["seq"], retained_metrics["rejection_reason"])
             continue
-        if time.monotonic() >= deadline:
-            raise AudioValidationError("audio_prepare_timeout", "Audio preparation took too long; your saved recording is still available.", details=diagnostics())
-        # Keep whole contextual spans. Never cut through an audible run simply
-        # to fill the remaining sample allowance. Recheck the exact fitted set:
-        # omitting a later span must not conceal clipping in the retained part.
-        fitted = []
-        remaining_samples = max_samples - len(joined) // 2
+        available = []
         for start, end in spans:
-            if end - start <= remaining_samples:
-                fitted.append((start, end))
-                remaining_samples -= end - start
-        if not fitted:
+            metrics, windows = _analyze_pcm(pcm, [(start, end)])
+            if not metrics["usable_for_clone"]:
+                continue
+            available.append({"seq": item["seq"], "start": start, "end": end,
+                              "active_samples": sum(b - a for a, b in windows)})
+        if not available:
+            reject(item["seq"], "insufficient_audible_audio")
             continue
-        retained_metrics, _ = _analyze_pcm(pcm, fitted)
+        sources[item["seq"]] = {"item": item, "metrics": source_metrics}
+        candidates.extend(available)
+    remaining_time()
+    # Free the last first-pass payload before beginning assembly.
+    if indexes:
+        data = b""
+        pcm = b""
+    ranked = sorted(candidates, key=lambda span: (-span["active_samples"] / (span["end"] - span["start"]), span["seq"], span["start"]))
+    max_samples = SAMPLE_RATE * max_sample_ms // 1000
+    chosen = {}
+    for span in ranked:
+        length = span["end"] - span["start"]
+        if selected_samples + length <= max_samples:
+            chosen.setdefault(span["seq"], []).append(span)
+            selected_samples += length
+            active_samples += span["active_samples"]
+    require_minimum()
+
+    # Pass two verifies the original bytes again, then copies selected complete
+    # contextual spans in source order. Never reuse metadata for changed audio.
+    selected = []
+    assembled_activity = 0
+    for seq in sorted(chosen):
+        remaining_time()
+        source = sources[seq]
+        item = source["item"]
+        data = read_source(item)
+        budget = remaining_time()
+        decoder_invocations += 1
+        pcm = _decode(data, item["mime"], 15000, timeout_seconds=budget)
+        source_metrics, _ = _analyze_pcm(pcm)
+        spans = sorted(chosen[seq], key=lambda span: span["start"])
+        coordinates = [(span["start"], span["end"]) for span in spans]
+        if source_metrics != source["metrics"] or any(start < 0 or end > len(pcm) // 2 for start, end in coordinates):
+            raise AudioValidationError("audio_analysis_changed", "Saved audio no longer matches its measured sample; preparation stopped.", details=diagnostics())
+        retained_metrics, _ = _analyze_pcm(pcm, coordinates)
         if not retained_metrics["usable_for_clone"]:
-            reject(item["seq"], retained_metrics["rejection_reason"])
-            continue
+            raise AudioValidationError("audio_analysis_changed", "The selected audio no longer passes its measured quality check.", details=diagnostics())
+        remaining_time()
         included = []
-        chunk_active_samples = 0
         chunk_samples = 0
-        for start, end in fitted:
+        chunk_activity = 0
+        for span in spans:
+            start, end = span["start"], span["end"]
             output_start = len(joined) // 2
-            span_active_samples = sum(max(0, min(end, window_end) - max(start, window_start))
-                                      for window_start, window_end in active_windows)
             joined.extend(memoryview(pcm)[start * 2:end * 2])
             included.append({"start_sample": start, "end_sample": end,
                              "output_start_sample": output_start, "output_end_sample": len(joined) // 2,
-                             "active_ms": round(span_active_samples * 1000 / SAMPLE_RATE)})
-            chunk_active_samples += span_active_samples
+                             "active_ms": round(span["active_samples"] * 1000 / SAMPLE_RATE)})
             chunk_samples += end - start
-        if not included:
-            continue
-        active_samples += chunk_active_samples
-        selected.append({"seq": item["seq"], "sha256": item["sha256"], "byte_count": len(data),
+            chunk_activity += span["active_samples"]
+        assembled_activity += chunk_activity
+        selected.append({"seq": seq, "sha256": item["sha256"], "byte_count": len(data),
                          "mime": item["mime"], "duration_ms": round(chunk_samples * 1000 / SAMPLE_RATE),
-                         "active_ms": round(chunk_active_samples * 1000 / SAMPLE_RATE),
+                         "active_ms": round(chunk_activity * 1000 / SAMPLE_RATE),
                          "clip_fraction": retained_metrics["clip_fraction"],
                          "decoded_source": source_metrics, "included_spans": included})
+    remaining_time()
+    if len(joined) // 2 != selected_samples or assembled_activity != active_samples:
+        raise AudioValidationError("audio_analysis_changed", "Audio sample assembly did not match its measured manifest.", details=diagnostics())
     active_ms = round(active_samples * 1000 / SAMPLE_RATE)
-    duration_ms = round(len(joined) * 1000 / (2 * SAMPLE_RATE))
-    if active_samples * 1000 < min_active_ms * SAMPLE_RATE:
-        raise AudioValidationError("insufficient_audio", f"Need more clear contributor audio before preparing the voice ({active_ms // 1000}s audible audio selected; {min_active_ms // 1000}s required).", details=diagnostics())
+    duration_ms = round(selected_samples * 1000 / SAMPLE_RATE)
     manifest = {
-        "provider": "elevenlabs", "selection": "decoded_spread_context_spans_v2",
+        "provider": "elevenlabs", "selection": "decoded_ranked_context_spans_v3",
         "capture_digest": capture["digest"], "last_seq": capture["last_seq"],
         "chunks": selected, "rejected": rejected, "total_ms": duration_ms,
         "active_ms": active_ms, "sample_rate": SAMPLE_RATE,
         "context_ms": ACTIVITY_CONTEXT_MS, "diagnostics": diagnostics(),
         "speaker_verified": False, "human_listening_required": True,
-        "screening_limits": "Energy and clipping only; does not establish speaker identity, remove other voices, or prove noise-free speech. Long low-energy gaps are trimmed with contextual padding; retained samples are unchanged.",
+        "screening_limits": "Local runtime, energy and clipping heuristics only; activity is not speech duration or a provider requirement. Does not establish speaker identity, remove other voices, or prove noise-free speech. Retained contextual PCM samples are unchanged.",
     }
     output_dir = Path(output_dir)
     if output_dir.is_symlink():
@@ -351,6 +414,7 @@ def prepare_clone_sample(chunks: list[dict], output_dir: Path, *, min_active_ms:
                 audio.writeframes(joined)
         with path.open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        remaining_time()
         byte_count = path.stat().st_size
         manifest["normalized_sha256"] = digest
         manifest["normalized_byte_count"] = byte_count

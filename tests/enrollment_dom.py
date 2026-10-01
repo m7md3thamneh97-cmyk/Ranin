@@ -294,6 +294,7 @@ def main():
     # Clearly shortened synthetic developer scenario. This is not long-session
     # reliability or human/native-listener voice acceptance.
     enrollment.MIN_CLONE_MS = 1000
+    enrollment.MIN_CLONE_ACTIVE_MS = 500
     capture_audio = synthetic_audio("webm")
     output = Path(os.environ.get("RANEEN_UI_OUTPUT_DIR", "/tmp/raneen-enrollment-ui"))
     output.mkdir(parents=True, exist_ok=True)
@@ -333,8 +334,10 @@ def main():
                     faults["clone_shortfall"] = False
                     route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": {
                         "code": "insufficient_audio", "message": "synthetic audible shortfall",
-                        "details": {"selected_active_ms": 49000, "minimum_active_ms": 60000,
-                                    "decoded_source_ms": 123000, "rejected_reasons": {}},
+                        "details": {"selected_duration_ms": 49000, "minimum_sample_ms": 60000,
+                                    "selected_active_ms": 35000, "minimum_active_ms": 30000,
+                                    "insufficiency": "sample_duration", "decoded_source_ms": 123000,
+                                    "rejected_reasons": {}},
                     }}))
                     return
                 path = parsed.path + ("?" + parsed.query if parsed.query else "")
@@ -448,6 +451,7 @@ def main():
                 page.locator("#finish").click()
                 shortfall = page.locator(".preparation-card .status-note[role=status]")
                 expect(shortfall).to_contain_text("Your recording is saved.")
+                expect(shortfall).to_contain_text("Selected sample")
                 expect(shortfall).to_contain_text("49s")
                 expect(shortfall).to_contain_text("60s needed")
                 expect(page.locator("#prepareAgent")).to_be_enabled()
