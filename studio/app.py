@@ -228,16 +228,26 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
 
     @app.middleware('http')
     async def protect(request: Request, call_next):
+        from .tester_access import authorize_request
+        path = request.url.path
+        public_test_access = (path == '/api/testing/redeem' and request.method == 'POST') or (path == '/api/testing/access' and request.method == 'GET')
+        account = None
+        if path.startswith('/api/'):
+            credential = request.headers.get('authorization', '')
+            account = store.one('SELECT id,role FROM users WHERE token_hash=?', (token_hash(credential[7:]),)) if credential.startswith('Bearer ') and len(credential) <= 520 else None
+            if account and account['role'] == 'tester':
+                try:
+                    authorize_request(store, account, path, request.method)
+                except HTTPException as exc:
+                    return Response(json.dumps({'detail': exc.detail}), status_code=exc.status_code, media_type='application/json', headers={'Cache-Control': 'no-store'})
         if public_origin:
             if request.headers.get('host', '') == 'healthcheck.railway.app' and request.url.path != '/healthz':
                 return Response('Not found.', status_code=404)
             # Validate before FastAPI reads an API request body. Never put credentials in URLs.
-            if request.url.path.startswith('/api/') and not request.url.path.startswith('/api/providers/vapi/'):
-                credential = request.headers.get('authorization', '')
-                account = store.one('SELECT id,role FROM users WHERE token_hash=?', (token_hash(credential[7:]),)) if credential.startswith('Bearer ') and len(credential) <= 520 else None
+            if request.url.path.startswith('/api/') and not request.url.path.startswith('/api/providers/vapi/') and not public_test_access:
                 if not account:
                     return Response('Authentication required.', status_code=401, headers={'Cache-Control': 'no-store'})
-                if owner_only and (account['role'] != 'admin' or (request.url.path == '/api/users' and request.method == 'POST')):
+                if owner_only and (account['role'] not in {'admin', 'tester'} or (request.url.path == '/api/users' and request.method == 'POST')):
                     return Response('Owner-only staging. Employee access is not enabled.', status_code=403, headers={'Cache-Control': 'no-store'})
         if request.method in ('POST','PUT','PATCH','DELETE'):
             # Provider-side evidence cannot be forged through legacy text APIs.
@@ -650,6 +660,8 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
 
     from .backend import install_backend
     install_backend(app, store, actor, get_profile, current_consent)
+    from .tester_access import install as install_tester_access
+    install_tester_access(app)
 
     static = Path(__file__).parent / 'static'
     app.mount('/static', StaticFiles(directory=static), name='static')

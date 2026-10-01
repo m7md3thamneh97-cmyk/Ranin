@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {workflowFailure} from '../studio/static/enrollment-errors.js';
 import {copy} from '../studio/static/enrollment-copy.js';
+import {confirmedResponseCount, needsResponseTeaching, hasPendingSpokenReview} from '../studio/static/enrollment-evidence-status.js';
 
 const {ChunkQueue, InterviewCapture} = await import('../studio/static/enrollment-capture.js');
 
@@ -75,7 +76,29 @@ test('uncertain provider operations and verified response evidence keep their ow
   const t=key=>copy.en[key];
   assert.equal(workflowFailure({detail:{code:'outcome_unknown',message:'Audio request timed out'}},t,'creatingVoice'),copy.en.outcomePending);
   assert.equal(workflowFailure({detail:'Confirmed evidence is required'},t,'buildingAgent'),copy.en.noExamples);
+  assert.equal(workflowFailure({detail:{code:'confirmed_evidence_required',message:'Private diagnostic'}},t,'buildingAgent'),copy.en.noExamples);
   assert.equal(workflowFailure({detail:'Need more clear contributor audio before preparing the voice'},t,'creatingVoice'),copy.en.moreSpeech);
+});
+test('saved and approved voice with no confirmed response uses teaching recovery, not voice creation', () => {
+  const journey={confirmed_patterns:0,chunk_count:4,saved_audio_ms:90000};
+  const workflow={voice_approved:true,voice_state:'ready',behavior_ready:false,learning:{confirmed_evidence_count:0}};
+  assert.equal(needsResponseTeaching(journey,workflow),true);
+  assert.equal(needsResponseTeaching(journey,{...workflow,voice_approved:false}),false);
+  assert.equal(needsResponseTeaching(journey,{...workflow,behavior_ready:true}),false);
+  assert.equal(needsResponseTeaching(journey,{...workflow,learning:{confirmed_evidence_count:1}}),false);
+  assert.equal(needsResponseTeaching({...journey,revoked:true},workflow),false);
+  assert.equal(confirmedResponseCount({}, {learning:{confirmed_evidence_count:-1}}),0);
+});
+test('spoken review hint follows server pending state and never treats it as approval', () => {
+  const pending={pending_patterns:1,confirmed_patterns:0};
+  assert.equal(hasPendingSpokenReview(pending),true);
+  assert.equal(confirmedResponseCount(pending),0);
+  assert.equal(hasPendingSpokenReview({...pending,revoked:true}),false);
+  assert.equal(hasPendingSpokenReview({pending_patterns:0,confirmed_patterns:1}),false);
+  for(const lang of ['en','ar']){
+    assert.ok(copy[lang].spokenReviewHint.includes('نعم احفظ هذا'));
+    assert.ok(copy[lang].spokenReviewHint.includes('Yes, save this'));
+  }
 });
 const deferred = () => {
   let resolve, reject;

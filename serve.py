@@ -1,4 +1,4 @@
-"""Owner-only hosted staging launcher for Render and Railway.
+"""Private hosted staging launcher for Render and Railway.
 
 Refuse to start without a canonical HTTPS origin, a dedicated mounted data
 filesystem, and an explicitly supplied strong owner credential. No cloud API

@@ -8,6 +8,7 @@ export function workflowFailure(error, translate, phase='') {
   const details=structured?.details||{};
   const t=translate;
   if(code==='outcome_unknown'||code==='provider_outcome_unknown')return t('outcomePending');
+  if(code==='confirmed_evidence_required')return t('noExamples');
   if(code==='clone_retry_limit')return t('cloneRetryLimit');
   if(code==='preview_retry_limit'||code==='voice_preview_retry_limit')return t('sampleRetryLimit');
   if(error?.message==='request_timeout')return t('operationTimeout');
