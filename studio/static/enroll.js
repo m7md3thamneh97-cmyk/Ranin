@@ -62,7 +62,7 @@ function renderConsent(){
 async function openSession(id,mic=false){
   if(S.session!==id&&S.capture?.hasPending){notice(t('saveFirst'),true);return;}
   if(S.busy||S.call){notice(t(S.call?'callAway':'preparingBackground'),true);return;}
-  if(S.session!==id){clearSamples();S.workflow=null;S.correction=false;}
+  if(S.session!==id){clearSamples();S.workflow=null;S.workflowError='';S.correction=false;}
   S.session=id;const journey=await request('/api/enrollment/sessions/'+encodeURIComponent(id)+'/journey');
   if(S.session!==id)return;S.journey=journey;
   if(!S.capture||S.capture.sessionId!==id)createCapture();
@@ -184,19 +184,22 @@ async function revoke(){
   if(!confirm(t('revokeConfirm')))return;const id=S.session,capture=S.capture;++S.workflowEpoch;S.busy=true;stopMic();stopPreviewLocal();clearSamples();capture?.pause({save:false}).catch(report);q('#revoke').disabled=true;
   try{await post('/api/enrollment/sessions/'+encodeURIComponent(id)+'/revoke',{confirm:true});if(S.session!==id||S.capture!==capture)return;S.call=null;S.capture=null;S.busy=false;await openSession(id);notice(t('revokedText'));}catch(e){S.busy=false;if(S.session===id&&q('#revoke'))q('#revoke').disabled=false;report(e);}
 }
-async function signout(){if(!await leave())return;clearInterval(S.poll);S.token='';S.session=null;S.capture=null;S.journey=null;S.sessions=[];S.transcript='';S.workflow=null;S.correction=false;clearSamples();login();}
+async function signout(){if(!await leave())return;clearInterval(S.poll);S.token='';S.session=null;S.capture=null;S.journey=null;S.sessions=[];S.transcript='';S.workflow=null;S.workflowError='';S.correction=false;clearSamples();login();}
 // Preparation only starts after an explicit click. Reloading reads server state;
 // it never repeats an uncertain provider create operation.
 function clearSamples(){stopSamples();for(const url of Object.values(S.samples))URL.revokeObjectURL(url);S.samples={};S.listened.clear();}
 function stopSamples(){app.querySelectorAll('audio').forEach((audio)=>audio.pause());}
 function configurationCard(config=S.workflow?.config){
   if(!config)return '';
-  return `<details class="card connection-card" ${Object.values(config).some((v)=>!v)?'open':''}><summary>${t('setupStatus')}</summary><ul class="connection-list">${[['interview','interviewService'],['voice','voiceService'],['agent','agentService']].map(([key,label])=>`<li><span>${t(label)}</span><span class="pill ${config[key]?'':'neutral'}">${t(config[key]?'setupReady':'setupMissing')}</span></li>`).join('')}</ul>${Object.values(config).some((v)=>!v)?`<p class="small muted">${t('configurationNote')}</p>`:''}</details>`;
+  const status=S.page==='prepare'?S.workflow?.voice_failure?.details?.http_status:null;
+  const voiceIssue=Number.isInteger(status)&&status>=300&&status<=599;
+  return `<details class="card connection-card" ${voiceIssue||Object.values(config).some((v)=>!v)?'open':''}><summary>${t('setupStatus')}</summary><ul class="connection-list">${[['interview','interviewService'],['voice','voiceService'],['agent','agentService']].map(([key,label])=>`<li><span>${t(label)}</span><span class="pill ${config[key]&&!(key==='voice'&&voiceIssue)?'':'neutral'}">${t(key==='voice'&&voiceIssue?'setupAttention':config[key]?'setupReady':'setupMissing')}</span></li>`).join('')}</ul>${voiceIssue?`<p id="voiceServiceStatus" class="small muted" dir="ltr">ElevenLabs · HTTP ${status}</p>`:''}${Object.values(config).some((v)=>!v)?`<p class="small muted">${t('configurationNote')}</p>`:''}</details>`;
 }
 function workflowMessage(w){
   if(S.workflowError)return S.workflowError;
   if(w.voice_state==='verification_required')return t('verificationPending');
   if(w.stage==='blocked'||w.operations?.some((o)=>['outcome_unknown','dispatching'].includes(o.state)))return t('outcomePending');
+  if(w.voice_failure)return workflowFailure({detail:w.voice_failure});
   if(!S.journey.enabled)return t('processingPaused');
   if(w.config&&(!w.config.voice||(w.voice_approved&&!w.config.agent)))return t('configurationNote');
   return '';
@@ -224,22 +227,29 @@ function renderPrepare(){
   const samplesReady=['question','number','correction'].every((kind)=>S.samples[kind]);
   const readyForApproval=samplesReady&&S.listened.size===3;
   const review=samplesReady&&!w.voice_approved;const status=workflowMessage(w);
-  shell(hero(t(review?'voiceReview':'prepareTitle'),t(review?'voiceReviewText':'prepareIntro'))+`<section class="card preparation-card">${S.busy?`<div class="working-mark" aria-hidden="true">ر</div><h2 role="status">${t(S.phase||'prepareWorking')}</h2><p>${t('prepareWorkingNote')}</p>`:review?`<div class="sample-list">${[['question','questionSample'],['number','numberSample'],['correction','correctionSample']].map(([kind,label])=>`<div class="sample-card"><div><h3>${t(label)}</h3><span id="heard-${kind}" class="small muted">${t(S.listened.has(kind)?'listened':'listen')}</span></div><audio id="sample-${kind}" controls preload="metadata" src="${esc(S.samples[kind])}" aria-label="${t(label)}"></audio></div>`).join('')}</div><p class="small muted">${t('approvalNote')}</p><button id="approveVoice" class="primary" ${!readyForApproval?'disabled':''}>${t('approveVoice')}</button>`:`<div class="preparation-steps"><p><span>1</span>${t('checkingEvidence')}</p><p><span>2</span>${t('creatingVoice')}</p><p><span>3</span>${t('makingSamples')}</p></div><button id="prepareAgent" class="primary" ${blocked||!S.journey.enabled||!w.config?.voice||(w.voice_approved&&!w.config?.agent)?'disabled':''}>${t(S.correction?'updateAgent':w.voice_approved?'continueSetup':'prepareStart')}</button>`}${status?`<p class="status-note" role="status">${esc(status)}</p>`:''}</section>${configurationCard()}<div class="bottom-actions">${S.call?`<button id="stopTest" class="secondary">${t('stopTest')}</button>`:''}<button id="returnInterview" class="text-button" ${S.busy||S.call?'disabled':''}>${t('addSpeech')}</button><button id="refreshWorkflow" class="secondary" ${S.busy?'disabled':''}>${t('refreshProgress')}</button><button id="revoke" class="text-button danger">${t('revoke')}</button></div>`,true);
+  const cloneFailed=(w.voice_state==='failed'||w.voice_failure?.code==='voice_clone_failed')&&!w.voice_approved;
+  const previewFailed=w.voice_failure?.code==='voice_preview_failed'&&!w.voice_approved;
+  const canRetryPreview=Object.values(w.preview_retry_allowed||{}).some(Boolean);
+  const canPrepare=!(blocked||!S.journey.enabled||!w.config?.voice||(w.voice_approved&&!w.config?.agent)||(cloneFailed&&!w.clone_retry_allowed)||(previewFailed&&!canRetryPreview));
+  shell(hero(t(review?'voiceReview':'prepareTitle'),t(review?'voiceReviewText':'prepareIntro'))+`<section class="card preparation-card">${S.busy?`<div class="working-mark" aria-hidden="true">ر</div><h2 role="status">${t(S.phase||'prepareWorking')}</h2><p>${t('prepareWorkingNote')}</p>`:review?`<div class="sample-list">${[['question','questionSample'],['number','numberSample'],['correction','correctionSample']].map(([kind,label])=>`<div class="sample-card"><div><h3>${t(label)}</h3><span id="heard-${kind}" class="small muted">${t(S.listened.has(kind)?'listened':'listen')}</span></div><audio id="sample-${kind}" controls preload="metadata" src="${esc(S.samples[kind])}" aria-label="${t(label)}"></audio></div>`).join('')}</div><p class="small muted">${t('approvalNote')}</p><button id="approveVoice" class="primary" ${!readyForApproval?'disabled':''}>${t('approveVoice')}</button>`:`<button id="prepareAgent" class="primary" ${canPrepare?'':'disabled'}>${t(S.correction?'updateAgent':w.voice_approved?'continueSetup':(cloneFailed&&w.clone_retry_allowed)||(previewFailed&&canRetryPreview)?'retryVoice':['sample_required','ready'].includes(w.voice_state)?'finish':'prepareStart')}</button>`}${status?`<p class="status-note" role="status">${esc(status)}</p>`:''}</section>${configurationCard()}<div class="bottom-actions">${S.call?`<button id="stopTest" class="secondary">${t('stopTest')}</button>`:''}<button id="returnInterview" class="text-button" ${S.busy||S.call?'disabled':''}>${t('addSpeech')}</button><button id="refreshWorkflow" class="secondary" ${S.busy?'disabled':''}>${t('refreshProgress')}</button><button id="revoke" class="text-button danger">${t('revoke')}</button></div>`,true);
   for(const kind of ['question','number','correction']){const audio=q('#sample-'+kind);if(audio){audio.onplay=()=>app.querySelectorAll('audio').forEach((other)=>{if(other!==audio)other.pause();});audio.onended=()=>{S.listened.add(kind);q('#heard-'+kind).textContent=t('listened');q('#approveVoice').disabled=S.listened.size!==3;};}}
   bind('#prepareAgent',prepareAgent);bind('#approveVoice',approveVoice);bind('#stopTest',endPreview);
   bind('#refreshWorkflow',async()=>{S.workflowError='';await fetchWorkflow();if(S.workflow.stage==='agent_ready'&&!S.correction){S.page='agent';renderAgent();}else renderPrepare();});
   bind('#returnInterview',async()=>{stopSamples();await refresh();S.page='interview';renderInterview();});bind('#revoke',revoke);
 }
 async function prepareAgent(){
-  if(S.busy)return;const id=S.session,base=path(),epoch=++S.workflowEpoch;const active=()=>S.session===id&&epoch===S.workflowEpoch&&!S.journey.revoked;S.busy=true;S.workflowError='';S.phase='checkingEvidence';renderPrepare();
+  if(S.busy)return;const id=S.session,base=path(),epoch=++S.workflowEpoch;const retryPreviews={...S.workflow.preview_retry_allowed};const active=()=>S.session===id&&epoch===S.workflowEpoch&&!S.journey.revoked;S.busy=true;S.workflowError='';S.phase=S.workflow.voice_approved?'checkingEvidence':'creatingVoice';renderPrepare();
   try{
     if(!S.workflow.voice_approved){
       S.phase='creatingVoice';renderPrepare();
-      const voice=await post(base+'/clone',{approve:true,final_seq:S.journey.next_seq-1},{timeout:120000});if(!active())return;
+      const approval={approve:true,final_seq:S.journey.next_seq-1};
+      if(S.workflow.clone_retry_allowed)approval.retry_failed=true;
+      const voice=await post(base+'/clone',approval,{timeout:120000});if(!active())return;
       if(['verification_required','outcome_unknown','failed'].includes(voice.state)){await fetchWorkflow();return;}
       S.phase='makingSamples';renderPrepare();
       for(const kind of ['question','number','correction']){
-        const blob=await post(base+'/preview',{approve:true,kind},{blob:true,timeout:90000});
+        const previewApproval={approve:true,kind};if(retryPreviews[kind])previewApproval.retry_failed=true;
+        const blob=await post(base+'/preview',previewApproval,{blob:true,timeout:90000});
         if(!active())return;if(!blob.size)throw Error('empty_preview');
         if(S.samples[kind])URL.revokeObjectURL(S.samples[kind]);S.samples[kind]=URL.createObjectURL(blob);
       }

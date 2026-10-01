@@ -381,7 +381,9 @@ def test_clone_provider_error_codes_preserve_operation_semantics(env, monkeypatc
     response = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
                            json={'approve': True, 'final_seq': 3})
     assert response.status_code == status
-    assert response.json()['detail'] == {'code': code, 'message': 'Synthetic provider clone failure.'}
+    assert response.json()['detail']['code'] == code
+    assert response.json()['detail']['message'].startswith('The voice provider')
+    assert 'Synthetic provider clone failure.' not in response.text
     operation = app.state.store.one("SELECT state FROM enrollment_operations WHERE session_id=? AND kind='voice_clone'", (sid,))
     assert operation['state'] == state
     again = client.post(f'/api/enrollment/sessions/{sid}/clone', headers=auth(owner),
@@ -411,7 +413,9 @@ def test_synthesis_provider_failure_is_not_audio_insufficiency(env, monkeypatch,
     response = client.post(f'/api/enrollment/sessions/{sid}/preview', headers=auth(owner),
                            json={'approve': True, 'kind': 'question'})
     assert response.status_code == 502
-    assert response.json()['detail'] == {'code': code, 'message': 'Synthetic speech synthesis failed.'}
+    assert response.json()['detail']['code'] == code
+    assert response.json()['detail']['message'].startswith('The voice provider')
+    assert 'Synthetic speech synthesis failed.' not in response.text
     assert app.state.store.one("SELECT state FROM enrollment_operations WHERE session_id=? AND kind='voice_preview'", (sid,))['state'] == state
     again = client.post(f'/api/enrollment/sessions/{sid}/preview', headers=auth(owner),
                         json={'approve': True, 'kind': 'question'})

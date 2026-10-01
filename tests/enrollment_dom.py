@@ -314,6 +314,8 @@ def main():
             page.set_default_timeout(10000)
             errors, external_requests, csp_errors, frame_headers = [], [], [], []
             session_create_requests = []
+            clone_requests = []
+            preview_requests = []
             faults = {"clone_shortfall": False}
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.on("console", lambda item: csp_errors.append(item.text) if item.type == "error" and "Content Security Policy" in item.text else None)
@@ -330,6 +332,10 @@ def main():
                     assert "authorization" not in request.all_headers(), "Owner access must not be passed into the call SDK"
                     route.fulfill(status=200, content_type="application/javascript", body=FAKE_DAILY)
                     return
+                if request.method == "POST" and parsed.path.endswith("/clone"):
+                    clone_requests.append((parsed.path, request.post_data_json))
+                if request.method == "POST" and parsed.path.endswith("/preview"):
+                    preview_requests.append((parsed.path, request.post_data_json))
                 if request.method == "POST" and parsed.path.endswith("/clone") and faults["clone_shortfall"]:
                     faults["clone_shortfall"] = False
                     route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": {
@@ -627,10 +633,142 @@ def main():
                 assert page.evaluate("window.__syntheticMedia.active") == 0
                 assert provider_before == (len(voice_only.opened), len(voice_only.closed), len(voice_only.clone_calls), len(voice_only.speech_calls), len(voice_only.assistants), len(voice_only.preview_calls))
                 page.screenshot(path=str(output / "enrollment-fresh-consent-en.png"), full_page=True)
+
+                # A persisted, definitively rejected legacy clone remains visible
+                # after reload. Reading progress must never repeat a paid create.
+                # The old manifest deliberately differs from today's selector;
+                # explicit retry still preserves its failed audit and saved audio.
+                recovery = SyntheticProvider()
+                original_speech = recovery.eleven_speech
+                speech_attempts = []
+
+                async def reject_first_question(api_key, voice_id, text):
+                    speech_attempts.append(text)
+                    if len(speech_attempts) == 1:
+                        assert text == enrollment.PREVIEW_TEXT["question"]
+                        raise enrollment.ProviderError("safe synthetic rejection", diagnostics={
+                            "http_status": 401, "provider_code": "invalid_api_key",
+                        })
+                    return await original_speech(api_key, voice_id, text)
+
+                recovery.eleven_speech = reject_first_question
+                app.state.enrollment_provider = recovery
+                created = client.post("/api/enrollment/sessions", headers=owner_headers, json={
+                    "self_attestation": True, "recording": True, "external_processing": True,
+                    "voice_cloning": True, "private_preview": True,
+                })
+                assert created.status_code == 201
+                failed_session = created.json()["id"]
+                uploaded = client.put("/api/enrollment/sessions/" + failed_session + "/chunks/0", content=capture_audio, headers=owner_headers | {
+                    "Content-Type": "audio/webm", "X-Speaker-Role": "contributor",
+                    "X-Chunk-Sha256": hashlib.sha256(capture_audio).hexdigest(), "X-Duration-Ms": "1000",
+                })
+                assert uploaded.status_code == 200
+                legacy_manifest = json.dumps({"algorithm": "synthetic_legacy_selection", "total_ms": 1000})
+                legacy_digest = hashlib.sha256(legacy_manifest.encode()).hexdigest()
+                failed_version = "synthetic-legacy-failed-version"
+                failed_operation = "synthetic-legacy-failed-operation"
+                stamp = enrollment.now()
+                app.state.store.execute("INSERT INTO enrollment_voice_versions VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                    failed_version, failed_session, 1, "elevenlabs", None, "failed",
+                    legacy_manifest, legacy_digest, stamp, stamp,
+                ))
+                app.state.store.execute("INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)", (
+                    failed_operation, failed_session, "voice_clone", "ivc-v1:" + legacy_digest,
+                    "failed", None, json.dumps({"error": "ElevenLabs clone returned HTTP 401.",
+                                               "voice_version_id": failed_version, "manifest_digest": legacy_digest}), stamp, stamp,
+                ))
+                app.state.store.execute("UPDATE enrollment_sessions SET voice_state='failed',updated=? WHERE id=?", (stamp, failed_session))
+                saved_recovery_audio = app.state.store.all("SELECT seq,sha256,byte_count FROM enrollment_chunks WHERE session_id=? ORDER BY seq", (failed_session,))
+                prior_request_count = len(clone_requests)
+
+                def open_failed_interview(expected_clone_count=0, expected_preview_count=0):
+                    page.reload()
+                    sign_in_english()
+                    history = page.locator("details").filter(has=page.locator('[data-session="' + failed_session + '"]'))
+                    history.locator("summary").click()
+                    page.locator('[data-session="' + failed_session + '"]').click()
+                    note = page.locator(".preparation-card .status-note[role=status]")
+                    expect(note).to_contain_text("ElevenLabs did not accept the API key.")
+                    expect(note).to_contain_text("your recording is saved.")
+                    expect(page.locator("#prepareAgent")).to_have_text("Try again")
+                    expect(page.locator("#prepareAgent")).to_be_enabled()
+                    expect(page.locator("#voiceServiceStatus")).to_have_text("ElevenLabs · HTTP 401")
+                    expect(page.locator(".connection-list li").filter(has_text="Voice").locator(".pill")).to_have_text("Needs attention")
+                    assert page.locator("#finish").count() == 0, "Persisted voice failure must restore the preparation screen"
+                    assert page.evaluate("window.__syntheticMedia.active") == 0
+                    assert len(clone_requests) == prior_request_count + expected_clone_count
+                    assert len(recovery.clone_calls) == expected_clone_count and not recovery.speech_calls
+                    assert len([item for item in preview_requests if item[0] == "/api/enrollment/sessions/" + failed_session + "/preview"]) == expected_preview_count
+                    assert len(speech_attempts) == expected_preview_count
+
+                open_failed_interview()
+                with page.expect_response("**/" + failed_session + "/workflow") as checked_progress:
+                    page.locator("#refreshWorkflow").click()
+                assert checked_progress.value.status == 200
+                expect(page.locator(".preparation-card .status-note[role=status]")).to_contain_text("ElevenLabs did not accept the API key.")
+                assert len(clone_requests) == prior_request_count
+                assert not recovery.clone_calls and not recovery.speech_calls
+                open_failed_interview()
+                assert_no_overflow()
+                page.screenshot(path=str(output / "enrollment-provider-key-rejected-en.png"), full_page=True)
+                with page.expect_request("**/" + failed_session + "/clone") as retry_request, page.expect_response("**/" + failed_session + "/preview") as rejected_preview:
+                    page.locator("#prepareAgent").click()
+                assert retry_request.value.post_data_json == {"approve": True, "final_seq": 0, "retry_failed": True}
+                assert rejected_preview.value.status == 502
+                rejected_detail = rejected_preview.value.json()["detail"]
+                assert rejected_detail["code"] == "voice_preview_failed" and rejected_detail["details"]["http_status"] == 401
+                expect(page.locator("#prepareAgent")).to_have_text("Try again")
+                expect(page.locator(".preparation-card .status-note[role=status]")).to_contain_text("ElevenLabs did not accept the API key.")
+                assert len(recovery.clone_calls) == 1 and not recovery.speech_calls
+                assert page.locator("#sample-question").count() == 0
+                failure_workflow = client.get("/api/enrollment/sessions/" + failed_session + "/workflow", headers=owner_headers).json()
+                assert failure_workflow["voice_failure"]["code"] == "voice_preview_failed"
+                assert failure_workflow["preview_retry_allowed"] == {"question": True, "number": False, "correction": False}
+                failed_preview_operation = app.state.store.one("SELECT id,state FROM enrollment_operations WHERE session_id=? AND kind='voice_preview'", (failed_session,))
+                assert failed_preview_operation["state"] == "failed"
+                open_failed_interview(expected_clone_count=1, expected_preview_count=1)
+                with page.expect_response("**/" + failed_session + "/workflow") as checked_preview_progress:
+                    page.locator("#refreshWorkflow").click()
+                assert checked_preview_progress.value.json()["voice_failure"]["code"] == "voice_preview_failed"
+                expect(page.locator("#prepareAgent")).to_have_text("Try again")
+                assert len(recovery.clone_calls) == 1 and not recovery.speech_calls and len(speech_attempts) == 1
+                open_failed_interview(expected_clone_count=1, expected_preview_count=1)
+                page.screenshot(path=str(output / "enrollment-preview-key-rejected-en.png"), full_page=True)
+                # Retry synthesis using the already-created voice; only the
+                # definitively rejected question receives an explicit retry flag.
+                with page.expect_request("**/" + failed_session + "/clone") as reused_clone, page.expect_request("**/" + failed_session + "/preview") as retried_question:
+                    page.locator("#prepareAgent").click()
+                assert reused_clone.value.post_data_json == {"approve": True, "final_seq": 0}
+                assert retried_question.value.post_data_json == {"approve": True, "kind": "question", "retry_failed": True}
+                expect(page.locator("#sample-question")).to_be_visible(timeout=30000)
+                assert len(clone_requests) == prior_request_count + 2
+                assert len(recovery.clone_calls) == 1 and len(recovery.speech_calls) == 3
+                recovery_previews = [body for path, body in preview_requests if path == "/api/enrollment/sessions/" + failed_session + "/preview"]
+                assert recovery_previews == [
+                    {"approve": True, "kind": "question"},
+                    {"approve": True, "kind": "question", "retry_failed": True},
+                    {"approve": True, "kind": "number"},
+                    {"approve": True, "kind": "correction"},
+                ]
+                assert not recovery.assistants and not recovery.preview_calls
+                for kind in ("question", "number", "correction"):
+                    page.locator("#sample-" + kind).evaluate("async audio => { audio.muted = true; await audio.play(); }")
+                    expect(page.locator("#heard-" + kind)).to_have_text("Listened")
+                expect(page.locator("#approveVoice")).to_be_enabled()
+                assert app.state.store.all("SELECT seq,sha256,byte_count FROM enrollment_chunks WHERE session_id=? ORDER BY seq", (failed_session,)) == saved_recovery_audio
+                legacy_operation = app.state.store.one("SELECT state,provider_id,detail FROM enrollment_operations WHERE id=?", (failed_operation,))
+                assert legacy_operation["state"] == "failed" and legacy_operation["provider_id"] is None
+                assert json.loads(legacy_operation["detail"])["error"] == "ElevenLabs clone returned HTTP 401."
+                assert app.state.store.one("SELECT state,provider_voice_id FROM enrollment_voice_versions WHERE id=?", (failed_version,)) == {"state": "failed", "provider_voice_id": None}
+                assert len(app.state.store.all("SELECT id FROM enrollment_operations WHERE session_id=? AND kind='voice_clone'", (failed_session,))) == 2
+                assert app.state.store.one("SELECT state FROM enrollment_operations WHERE id=?", (failed_preview_operation["id"],))["state"] == "failed"
+                assert len(app.state.store.all("SELECT id FROM enrollment_operations WHERE session_id=? AND kind='voice_preview'", (failed_session,))) == 4
+                page.screenshot(path=str(output / "enrollment-provider-retry-voice-review-en.png"), full_page=True)
                 assert not errors, errors
                 assert not csp_errors, csp_errors
                 assert not external_requests, external_requests
-                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, one-action interview recovery, trusted evidence, decoded audio, one-action voice preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, voice preparation without behavior/Vapi, exhausted-interview fresh consent, mobile overflow and CSP.")
+                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, one-action interview recovery, trusted evidence, decoded audio, one-action voice preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, voice preparation without behavior/Vapi, exhausted-interview fresh consent, persisted clone/preview rejection with explicit retry and preserved audio/audit, mobile overflow and CSP.")
                 print("Generated tones and private synthetic provider events only: no physical microphone, real provider call, real voice clone, or human voice-quality acceptance was tested.")
             except Exception:
                 page.screenshot(path=str(output / "enrollment-failure.png"), full_page=True)

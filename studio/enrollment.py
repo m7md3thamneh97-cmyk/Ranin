@@ -34,6 +34,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .app import now, token_hash, uid
 from .enrollment_journey import journey_summary, recovery_summary
+from .enrollment_provider_errors import (
+    KNOWN_REJECTIONS, provider_failure, response_diagnostics, retryable_clone, sanitize_diagnostics, stored_failure,
+)
 
 FEATURE = "RANEEN_VOICE_ENROLLMENT_ENABLED"
 CONSENT_VERSION = "voice-enrollment-v1"
@@ -50,6 +53,7 @@ SESSION_MAX = 220 * 1024 * 1024
 MIN_CLONE_MS = 60_000
 MIN_CLONE_ACTIVE_MS = 30_000
 MAX_CLONE_MS = 125_000
+MAX_CLONE_ATTEMPTS = 3
 MAX_EVIDENCE = 40
 OPENAI_BASE = "https://api.openai.com/v1"
 ELEVEN_BASE = "https://api.elevenlabs.io/v1"
@@ -195,10 +199,12 @@ class ExternalApproval(Strict):
 
 class CloneRequest(ExternalApproval):
     final_seq: int = Field(ge=0,le=10000)
+    retry_failed: bool = False
 
 class PreviewRequest(Strict):
     approve: bool = False
     kind: Literal["question", "number", "correction"]
+    retry_failed: bool = False
 
 class AssistantRequest(Strict):
     approve: bool = False
@@ -233,9 +239,10 @@ def _safe_public_key() -> str:
 
 
 class ProviderError(Exception):
-    def __init__(self, message: str, *, uncertain: bool = False):
+    def __init__(self, message: str, *, uncertain: bool = False, diagnostics: dict | None = None):
         super().__init__(message)
         self.uncertain = uncertain
+        self.diagnostics = sanitize_diagnostics(diagnostics)
 
 
 class Providers:
@@ -314,7 +321,7 @@ class Providers:
             for filename, path, mime in files:
                 handle = path.open("rb")
                 opened.append(handle)
-                multipart.append(("files[]", (filename, handle, mime)))
+                multipart.append(("files", (filename, handle, mime)))
             async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=10), follow_redirects=False) as client:
                 r = await client.post(
                     ELEVEN_BASE + "/voices/add",
@@ -329,22 +336,28 @@ class Providers:
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             raise ProviderError("ElevenLabs clone request had an uncertain network outcome.", uncertain=True) from exc
         except httpx.HTTPError as exc:
-            raise ProviderError("ElevenLabs clone request failed.", uncertain=False) from exc
+            raise ProviderError("ElevenLabs clone request had an uncertain network outcome.", uncertain=True) from exc
         finally:
             for handle in opened:
                 handle.close()
         if r.status_code >= 500:
-            raise ProviderError(f"ElevenLabs clone returned HTTP {r.status_code}.", uncertain=True)
+            raise ProviderError(f"ElevenLabs clone returned HTTP {r.status_code}.", uncertain=True,
+                                diagnostics=response_diagnostics(r))
         if r.status_code >= 300:
-            raise ProviderError(f"ElevenLabs clone returned HTTP {r.status_code}.", uncertain=False)
+            raise ProviderError(f"ElevenLabs clone returned HTTP {r.status_code}.", uncertain=r.status_code not in KNOWN_REJECTIONS,
+                                diagnostics=response_diagnostics(r))
         try:
             data = r.json()
         except ValueError as exc:
             raise ProviderError("ElevenLabs clone returned invalid JSON.", uncertain=True) from exc
+        if not isinstance(data, dict):
+            raise ProviderError('ElevenLabs clone returned an invalid result object.', uncertain=True)
         voice_id = data.get("voice_id")
         if not isinstance(voice_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", voice_id):
             raise ProviderError("ElevenLabs clone result did not contain a valid voice ID.", uncertain=True)
-        return {"voice_id": voice_id, "requires_verification": bool(data.get("requires_verification"))}
+        if type(data.get('requires_verification')) is not bool:
+            raise ProviderError('ElevenLabs clone did not return a usable verification state.', uncertain=True)
+        return {"voice_id": voice_id, "requires_verification": data['requires_verification']}
 
     async def eleven_delete_voice(self, api_key: str, voice_id: str) -> None:
         try:
@@ -373,9 +386,10 @@ class Providers:
                     },
                 )
         except httpx.HTTPError as exc:
-            raise ProviderError("ElevenLabs speech synthesis failed.") from exc
+            raise ProviderError("ElevenLabs speech synthesis had an uncertain network outcome.", uncertain=True) from exc
         if r.status_code >= 300:
-            raise ProviderError(f"ElevenLabs speech synthesis returned HTTP {r.status_code}.")
+            raise ProviderError(f"ElevenLabs speech synthesis returned HTTP {r.status_code}.",
+                                uncertain=r.status_code not in KNOWN_REJECTIONS, diagnostics=response_diagnostics(r))
         if len(r.content) < 1000 or len(r.content) > 8 * 1024 * 1024:
             raise ProviderError("ElevenLabs speech synthesis returned unusable audio.")
         return bytes(r.content)
@@ -1097,6 +1111,128 @@ training and do not claim to be the contributor. Session id: {ident}
             (session_id,),
         )
 
+    def clone_operations(session_id: str, db=None):
+        sql = "SELECT * FROM enrollment_operations WHERE session_id=? AND kind='voice_clone' ORDER BY created,rowid"
+        return [dict(x) for x in db.execute(sql, (session_id,)).fetchall()] if db else store.all(sql, (session_id,))
+
+    def clone_failure(operation: dict, attempts: int, *, allowed: bool = False):
+        failure = stored_failure(operation)
+        failure['details'] = failure.get('details', {}) | {
+            'reason': failure.get('details', {}).get('reason', 'provider'),
+            'retry_allowed': allowed, 'attempts': attempts, 'attempt_limit': MAX_CLONE_ATTEMPTS,
+        }
+        return failure
+
+    def check_clone_attempt(operations: list[dict], retry_failed: bool):
+        """Read-only preflight and the same checks under the atomic create claim."""
+        busy = next((x for x in reversed(operations) if x['state'] in {'dispatching', 'outcome_unknown'}), None)
+        if busy:
+            raise HTTPException(409, clone_failure(busy, len(operations)))
+        if len(operations) >= MAX_CLONE_ATTEMPTS:
+            raise HTTPException(429, {
+                'code': 'clone_retry_limit', 'message': 'The three-attempt private voice allowance is used.',
+                'details': {'reason': 'provider', 'retry_allowed': False,
+                            'attempts': len(operations), 'attempt_limit': MAX_CLONE_ATTEMPTS},
+            })
+        if operations:
+            old = operations[-1]
+            allowed = retryable_clone(old)
+            if not retry_failed or not allowed:
+                raise HTTPException(409, clone_failure(old, len(operations), allowed=allowed))
+
+    def claim_clone(session_id: str, manifest: dict, retry_failed: bool):
+        """Allocate each clone attempt and its immutable voice version together."""
+        with store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            session = db.execute('SELECT * FROM enrollment_sessions WHERE id=?', (session_id,)).fetchone()
+            if not session or session['revoked_at']:
+                raise HTTPException(410, 'Enrollment consent was withdrawn.')
+            consent_data = json.loads(session['consent_json'])
+            if not consent_data.get('voice_cloning') or not consent_data.get('external_processing'):
+                raise HTTPException(409, 'Enrollment does not authorize voice cloning and external processing.')
+            operations = clone_operations(session_id, db)
+            if session['voice_id']:
+                raise HTTPException(409, 'This enrollment already has its private voice; reuse it.')
+            check_clone_attempt(operations, retry_failed)
+            attempt = len(operations) + 1
+            # Source spans and their selection algorithm stay unchanged. The
+            # separate provider-attempt metadata makes the immutable audit version
+            # unique when a rejected request is explicitly repeated with same audio.
+            attempt_manifest = manifest if attempt == 1 else manifest | {'provider_attempt': attempt}
+            manifest_serial = _json(attempt_manifest)
+            digest = hashlib.sha256(manifest_serial.encode()).hexdigest()
+            next_version = db.execute(
+                'SELECT COALESCE(MAX(version),0)+1 AS v FROM enrollment_voice_versions WHERE session_id=?',
+                (session_id,),
+            ).fetchone()['v']
+            operation_id, version_id, stamp = uid(), uid(), now()
+            operation_detail = {'voice_version_id': version_id, 'manifest_digest': digest, 'attempt': attempt}
+            db.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,NULL,?,?,?)',
+                       (operation_id, session_id, 'voice_clone', 'ivc-v1:' + digest, 'dispatching',
+                        _json(operation_detail), stamp, stamp))
+            db.execute('INSERT INTO enrollment_voice_versions VALUES(?,?,?,?,NULL,?,?,?,?,?)',
+                       (version_id, session_id, next_version, 'elevenlabs', 'creating',
+                        manifest_serial, digest, stamp, stamp))
+            db.execute("UPDATE enrollment_sessions SET voice_state='creating',updated=? WHERE id=?", (stamp, session_id))
+        return {'id': operation_id, 'attempt': attempt}, version_id, next_version, digest
+
+    def preview_attempts(operations: list[dict], voice_id: str, kind: str):
+        base = f'{voice_id}:{kind}'
+        return [x for x in operations if x['kind'] == 'voice_preview' and
+                (x['op_key'] == base or x['op_key'].startswith(base + ':attempt:'))]
+
+    def preview_retry(operation: dict | None):
+        return bool(operation and operation['state'] == 'failed' and not operation['provider_id']
+                    and stored_failure(operation).get('details', {}).get('rejected'))
+
+    def preview_failure(operation: dict, attempts: int, *, allowed=False):
+        failure = stored_failure(operation)
+        failure['details'] = failure.get('details', {}) | {
+            'reason': failure.get('details', {}).get('reason', 'provider'),
+            'retry_allowed': allowed, 'attempts': attempts, 'attempt_limit': MAX_CLONE_ATTEMPTS,
+        }
+        return failure
+
+    def claim_preview(session_id: str, voice_id: str, kind: str, retry_failed: bool):
+        with store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            session = db.execute('SELECT * FROM enrollment_sessions WHERE id=?', (session_id,)).fetchone()
+            if not session or session['revoked_at']:
+                raise HTTPException(410, 'Enrollment consent was withdrawn.')
+            if session['voice_id'] != voice_id or session['voice_state'] not in {'sample_required', 'ready'}:
+                raise HTTPException(409, 'Voice changed or requires provider verification before synthesis.')
+            consent_data = json.loads(session['consent_json'])
+            if not consent_data.get('voice_cloning') or not consent_data.get('external_processing'):
+                raise HTTPException(409, 'Enrollment does not authorize voice synthesis and external processing.')
+            operations = [dict(x) for x in db.execute(
+                "SELECT * FROM enrollment_operations WHERE session_id=? AND kind='voice_preview' ORDER BY created,rowid",
+                (session_id,),
+            ).fetchall()]
+            attempts = preview_attempts(operations, voice_id, kind)
+            if attempts and attempts[-1]['state'] == 'succeeded':
+                return attempts[-1], False
+            busy = next((x for x in reversed(operations) if x['state'] in {'dispatching', 'outcome_unknown'}), None)
+            if busy:
+                raise HTTPException(409, preview_failure(busy, len(attempts)))
+            if len(attempts) >= MAX_CLONE_ATTEMPTS:
+                raise HTTPException(429, {
+                    'code': 'voice_preview_retry_limit', 'message': 'The three-attempt allowance for this voice sample is used.',
+                    'details': {'reason': 'provider', 'retry_allowed': False,
+                                'attempts': len(attempts), 'attempt_limit': MAX_CLONE_ATTEMPTS},
+                })
+            if attempts:
+                allowed = preview_retry(attempts[-1])
+                if not retry_failed or not allowed:
+                    raise HTTPException(409, preview_failure(attempts[-1], len(attempts), allowed=allowed))
+            attempt = len(attempts) + 1
+            base = f'{voice_id}:{kind}'
+            key = base if attempt == 1 else base + ':attempt:' + str(attempt)
+            operation_id, stamp = uid(), now()
+            db.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,NULL,?,?,?)',
+                       (operation_id, session_id, 'voice_preview', key, 'dispatching',
+                        _json({'preview_kind': kind, 'voice_id': voice_id, 'attempt': attempt}), stamp, stamp))
+        return {'id': operation_id, 'attempt': attempt}, True
+
     @app.post("/api/enrollment/sessions/{ident}/clone")
     async def create_clone(ident: str, body: CloneRequest, user=Depends(admin)):
         gate()
@@ -1124,6 +1260,7 @@ training and do not claim to be the contributor. Session id: {ident}
         live=store.one("SELECT state FROM enrollment_realtime_calls WHERE session_id=?",(ident,))
         if live and live['state'] in {'open','dispatching','close_unknown','outcome_unknown'}:
             raise HTTPException(409,'Pause and finish saving the interview before preparing the voice.')
+        check_clone_attempt(clone_operations(ident), body.retry_failed)
         chosen, manifest = await asyncio.to_thread(select_clone_chunks, ident,body.final_seq)
         try:
             consent(own_session(ident,user), "voice_cloning")
@@ -1133,49 +1270,7 @@ training and do not claim to be the contributor. Session id: {ident}
                     409,
                     {'code': 'insufficient_audio', 'message': f"The selected sample is shorter than the required recording duration ({manifest['total_ms']//1000}s selected)."},
                 )
-            manifest_serial = _json(manifest)
-            manifest_digest = hashlib.sha256(manifest_serial.encode()).hexdigest()
-            operation, fresh = op_start(ident, "voice_clone", "ivc-v1:" + manifest_digest)
-            if not fresh:
-                version = store.one(
-                    "SELECT id,state,provider_voice_id FROM enrollment_voice_versions "
-                    "WHERE session_id=? AND manifest_digest=?",
-                    (ident, manifest_digest),
-                )
-                if operation["state"] == "succeeded":
-                    return {
-                        "state": version["state"] if version else "ready",
-                        "voice_id": operation["provider_id"],
-                        "voice_version_id": version["id"] if version else None,
-                        "reused": True,
-                    }
-                raise HTTPException(
-                    409,
-                    {'code': 'outcome_unknown' if operation['state'] in {'dispatching', 'outcome_unknown'} else 'voice_clone_failed',
-                     'message': f"Voice clone operation for this exact sample set is {operation['state']}; "
-                                "do not retry it blindly. Reconcile the provider outcome before retrying."},
-                )
-
-            next_version = store.one(
-                "SELECT COALESCE(MAX(version),0)+1 AS v FROM enrollment_voice_versions WHERE session_id=?",
-                (ident,),
-            )["v"]
-            voice_version_id = uid()
-            stamp = now()
-            store.execute(
-                "INSERT INTO enrollment_voice_versions VALUES(?,?,?,?,NULL,?,?,?,?,?)",
-                (
-                    voice_version_id,
-                    ident,
-                    next_version,
-                    "elevenlabs",
-                    "creating",
-                    manifest_serial,
-                    manifest_digest,
-                    stamp,
-                    stamp,
-                ),
-            )
+            operation, voice_version_id, next_version, manifest_digest = claim_clone(ident, manifest, body.retry_failed)
             api_key = _require_key("ELEVENLABS_API_KEY")
             files = []
             for chunk in chosen:
@@ -1186,45 +1281,43 @@ training and do not claim to be the contributor. Session id: {ident}
                 result = await app.state.enrollment_provider.eleven_clone(
                     api_key, "Raneen private enrollment " + ident[:8] + " voice-v" + str(next_version), files
                 )
+                if (not isinstance(result, dict) or not isinstance(result.get('voice_id'), str)
+                        or not re.fullmatch(r'[A-Za-z0-9_-]{8,100}', result['voice_id'])
+                        or type(result.get('requires_verification')) is not bool):
+                    raise ProviderError('The voice provider returned an unverified clone result.', uncertain=True)
             except ProviderError as exc:
                 state = "outcome_unknown" if exc.uncertain else "failed"
-                op_update(
-                    operation["id"],
-                    state,
-                    detail={"error": str(exc), "voice_version_id": voice_version_id, "manifest_digest": manifest_digest},
-                )
-                store.execute(
-                    "UPDATE enrollment_voice_versions SET state=?,updated=? WHERE id=?",
-                    (state, now(), voice_version_id),
-                )
-                store.execute(
-                    "UPDATE enrollment_sessions SET voice_state=?,updated=? WHERE id=?",
-                    (state, now(), ident),
-                )
-                raise HTTPException(502 if exc.uncertain else 422, {
-                    'code': 'outcome_unknown' if exc.uncertain else 'voice_clone_failed',
-                    'message': str(exc),
-                }) from None
+                failure = provider_failure(exc, 'voice_clone')
+                if exc.diagnostics:
+                    failure['details'] = failure['details'] | {
+                        'retry_allowed': not exc.uncertain and exc.diagnostics['rejected'] and operation['attempt'] < MAX_CLONE_ATTEMPTS,
+                        'attempts': operation['attempt'], 'attempt_limit': MAX_CLONE_ATTEMPTS,
+                    }
+                stamp = now()
+                with store.db() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute('UPDATE enrollment_operations SET state=?,detail=?,updated=? WHERE id=?',
+                               (state, _json({'failure': failure, 'voice_version_id': voice_version_id,
+                                              'manifest_digest': manifest_digest, 'attempt': operation['attempt']}),
+                                stamp, operation['id']))
+                    db.execute('UPDATE enrollment_voice_versions SET state=?,updated=? WHERE id=?',
+                               (state, stamp, voice_version_id))
+                    db.execute('UPDATE enrollment_sessions SET voice_state=?,updated=? WHERE id=?',
+                               (state, stamp, ident))
+                raise HTTPException(502 if exc.uncertain else 422, failure) from None
             state = "verification_required" if result["requires_verification"] else "sample_required"
-            op_update(
-                operation["id"],
-                "succeeded",
-                provider_id=result["voice_id"],
-                detail={
-                    "requires_verification": result["requires_verification"],
-                    "voice_version_id": voice_version_id,
-                    "manifest_digest": manifest_digest,
-                },
-            )
             stamp = now()
-            store.execute(
-                "UPDATE enrollment_voice_versions SET provider_voice_id=?,state=?,updated=? WHERE id=?",
-                (result["voice_id"], state, stamp, voice_version_id),
-            )
-            store.execute(
-                "UPDATE enrollment_sessions SET voice_id=?,voice_state=?,updated=? WHERE id=?",
-                (result["voice_id"], state, stamp, ident),
-            )
+            with store.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute("UPDATE enrollment_operations SET state='succeeded',provider_id=?,detail=?,updated=? WHERE id=?",
+                           (result['voice_id'], _json({'requires_verification': result['requires_verification'],
+                                                       'voice_version_id': voice_version_id,
+                                                       'manifest_digest': manifest_digest,
+                                                       'attempt': operation['attempt']}), stamp, operation['id']))
+                db.execute('UPDATE enrollment_voice_versions SET provider_voice_id=?,state=?,updated=? WHERE id=?',
+                           (result['voice_id'], state, stamp, voice_version_id))
+                db.execute('UPDATE enrollment_sessions SET voice_id=?,voice_state=?,updated=? WHERE id=?',
+                           (result['voice_id'], state, stamp, ident))
             if own_session(ident, user, require_active=False)["revoked_at"]:
                 await cleanup_provider_artifacts(ident)
                 raise HTTPException(410, "Consent was withdrawn during voice preparation; cleanup was scheduled.")
@@ -1249,8 +1342,7 @@ training and do not claim to be the contributor. Session id: {ident}
         if row["voice_state"] not in {"sample_required", "ready"} or not row["voice_id"]:
             raise HTTPException(409, "Voice requires provider verification before synthesis.")
         api_key = _require_key("ELEVENLABS_API_KEY")
-        key = f"{row['voice_id']}:{body.kind}"
-        operation, fresh = op_start(ident, "voice_preview", key)
+        operation, fresh = claim_preview(ident, row['voice_id'], body.kind, body.retry_failed)
         preview_path = root / ident / "previews" / (row['voice_id'] + '-' + body.kind + ".mp3")
         if not fresh:
             if operation["state"] == "succeeded" and preview_path.is_file():
@@ -1263,16 +1355,23 @@ training and do not claim to be the contributor. Session id: {ident}
             audio = await app.state.enrollment_provider.eleven_speech(api_key, row["voice_id"], PREVIEW_TEXT[body.kind])
             quality = await asyncio.to_thread(validate_synthesized_audio, audio)
         except (ProviderError, AudioValidationError) as exc:
-            op_update(operation["id"], "outcome_unknown" if getattr(exc,'uncertain',False) else "failed", detail={"error": str(exc)})
             if getattr(exc, 'uncertain', False):
                 code = 'outcome_unknown'
             elif isinstance(exc, AudioValidationError):
                 code = 'decoder_unavailable' if exc.code == 'decoder_unavailable' else 'invalid_voice_preview'
             else:
                 code = 'voice_preview_failed'
-            detail = {'code': code, 'message': str(exc)}
-            if getattr(exc, 'details', None) is not None:
+            detail = provider_failure(exc, 'voice_preview') if isinstance(exc, ProviderError) else {'code': code, 'message': str(exc)}
+            if isinstance(exc, ProviderError) and exc.diagnostics:
+                detail['details'] = detail['details'] | {
+                    'retry_allowed': not exc.uncertain and exc.diagnostics['rejected'] and operation['attempt'] < MAX_CLONE_ATTEMPTS,
+                    'attempts': operation['attempt'], 'attempt_limit': MAX_CLONE_ATTEMPTS,
+                }
+            elif getattr(exc, 'details', None) is not None:
                 detail['details'] = exc.details
+            op_update(operation['id'], 'outcome_unknown' if getattr(exc, 'uncertain', False) else 'failed',
+                      detail={'failure': detail, 'preview_kind': body.kind,
+                              'voice_id': row['voice_id'], 'attempt': operation['attempt']})
             raise HTTPException(502, detail) from None
         # Provider completion is recorded before checking consent again. A withdrawn
         # enrollment never receives the late sample or reactivates playback.
@@ -1425,17 +1524,40 @@ training and do not claim to be the contributor. Session id: {ident}
     def workflow(ident: str, user):
         row = own_session(ident,user,require_active=False)
         approved = bool(store.one('SELECT approved FROM enrollment_voice_approvals WHERE session_id=? AND voice_id=?',(ident,row['voice_id'])))
-        operations = store.all("SELECT kind,state,provider_id,detail FROM enrollment_operations WHERE session_id=? ORDER BY created",(ident,))
+        operations = store.all("SELECT * FROM enrollment_operations WHERE session_id=? ORDER BY created,rowid",(ident,))
         matched = any(x['kind']=='vapi_assistant' and x['state']=='succeeded' and x['provider_id']==row['assistant_id'] and json.loads(x['detail']).get('behavior_id')==row['active_behavior_id'] for x in operations)
         active_behavior=store.one('SELECT payload FROM enrollment_behavior_versions WHERE session_id=? AND id=?',(ident,row['active_behavior_id']))
         trusted_behavior=bool(active_behavior and json.loads(active_behavior['payload']).get('evidence_origin')=='trusted_audio_v1')
         matched=matched and trusted_behavior
         pending = any(x['state'] in {'dispatching','outcome_unknown'} and not x['kind'].startswith('cleanup_') for x in operations)
         call = store.one("SELECT state FROM enrollment_preview_calls WHERE session_id=? ORDER BY created DESC LIMIT 1",(ident,))
-        stage = 'revoked' if row['revoked_at'] else 'blocked' if pending or row['voice_state']=='verification_required' else 'agent_ready' if matched and approved else 'voice_review' if row['voice_state'] in {'sample_required','ready'} else 'collecting'
+        clones = [x for x in operations if x['kind'] == 'voice_clone']
+        clone_busy = any(x['state'] in {'dispatching', 'outcome_unknown'} for x in clones)
+        last_clone = clones[-1] if clones else None
+        clone_retry_allowed = bool(_enabled() and not row['revoked_at'] and not row['voice_id'] and
+                                   not clone_busy and len(clones) < MAX_CLONE_ATTEMPTS and retryable_clone(last_clone))
+        preview_busy = any(x['kind'] == 'voice_preview' and x['state'] in {'dispatching', 'outcome_unknown'} for x in operations)
+        preview_retry_allowed = {}
+        voice_failures = []
+        if last_clone and not row['voice_id'] and last_clone['state'] in {'failed', 'dispatching', 'outcome_unknown'}:
+            voice_failures.append((last_clone['created'], clone_failure(last_clone, len(clones), allowed=clone_retry_allowed)))
+        for kind in PREVIEW_TEXT:
+            attempts = preview_attempts(operations, row['voice_id'] or '', kind)
+            old = attempts[-1] if attempts else None
+            allowed = bool(_enabled() and not row['revoked_at'] and row['voice_id'] and not preview_busy and
+                           len(attempts) < MAX_CLONE_ATTEMPTS and preview_retry(old))
+            preview_retry_allowed[kind] = allowed
+            if old and old['state'] in {'failed', 'dispatching', 'outcome_unknown'}:
+                voice_failures.append((old['created'], preview_failure(old, len(attempts), allowed=allowed)))
+        voice_failure = max(voice_failures, key=lambda x: x[0])[1] if voice_failures else None
+        failed_voice = bool(last_clone and not row['voice_id'] and last_clone['state'] == 'failed')
+        stage = 'revoked' if row['revoked_at'] else 'blocked' if pending or row['voice_state']=='verification_required' else 'agent_ready' if matched and approved else 'voice_review' if row['voice_state'] in {'sample_required','ready'} else 'preparing' if failed_voice else 'collecting'
         config = {'interview':bool(os.environ.get('OPENAI_API_KEY')), 'voice':bool(os.environ.get('ELEVENLABS_API_KEY')), 'agent':bool(os.environ.get('VAPI_API_KEY'))}
         reason = 'Enrollment was revoked.' if row['revoked_at'] else 'A provider outcome needs reconciliation.' if pending else 'Provider voice verification is required.' if row['voice_state']=='verification_required' else None
-        return {'stage':stage,'enabled':_enabled(),'config':config,'voice_state':row['voice_state'],'voice_approved':approved,'behavior_ready':trusted_behavior,'behavior_id':row['active_behavior_id'],'assistant_ready':matched,'assistant_matches_behavior':matched,'preview_allowed':_enabled() and not row['revoked_at'] and approved and matched and not pending and not (call and call['state'] in {'open','dispatching','close_unknown','outcome_unknown'}),'blocking_reason':reason,'operations':[{'kind':x['kind'],'state':x['state']} for x in operations], 'preview_call_state':call['state'] if call else 'none'}
+        return {'stage':stage,'enabled':_enabled(),'config':config,'voice_state':row['voice_state'],'voice_approved':approved,'behavior_ready':trusted_behavior,'behavior_id':row['active_behavior_id'],'assistant_ready':matched,'assistant_matches_behavior':matched,'preview_allowed':_enabled() and not row['revoked_at'] and approved and matched and not pending and not (call and call['state'] in {'open','dispatching','close_unknown','outcome_unknown'}),'blocking_reason':reason,'operations':[{'kind':x['kind'],'state':x['state']} for x in operations], 'preview_call_state':call['state'] if call else 'none',
+                'voice_failure': voice_failure, 'clone_retry_allowed': clone_retry_allowed,
+                'clone_attempts': len(clones), 'clone_attempt_limit': MAX_CLONE_ATTEMPTS,
+                'preview_retry_allowed': preview_retry_allowed}
 
     @app.get('/api/enrollment/sessions/{ident}/workflow')
     def get_workflow(ident: str, user=Depends(admin)):

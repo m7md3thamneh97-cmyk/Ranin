@@ -8,6 +8,8 @@ export function workflowFailure(error, translate, phase='') {
   const details=structured?.details||{};
   const t=translate;
   if(code==='outcome_unknown'||code==='provider_outcome_unknown')return t('outcomePending');
+  if(code==='clone_retry_limit')return t('cloneRetryLimit');
+  if(code==='preview_retry_limit'||code==='voice_preview_retry_limit')return t('sampleRetryLimit');
   if(error?.message==='request_timeout')return t('operationTimeout');
   if(code==='audio_analysis_incomplete')return t('audioAnalysisIncomplete');
   if(code==='insufficient_audio'){
@@ -26,7 +28,11 @@ export function workflowFailure(error, translate, phase='') {
   if(['audio_prepare_timeout','audio_decode_timeout'].includes(code))return t('audioCheckTimeout');
   if(code==='audio_sequence_gap')return t('saveFirst');
   if(['invalid_audio','audio_unavailable','audio_checksum_mismatch','audio_analysis_changed','audio_too_long','invalid_audio_file','audio_too_large','unsupported_audio','invalid_audio_manifest','invalid_audio_directory','invalid_audio_limits','invalid_speaker_role','invalid_final_sequence'].includes(code))return t('audioReadFailed');
-  if(code==='voice_clone_failed')return t('cloneFailed');
+  if(['voice_clone_failed','voice_preview_failed'].includes(code)){
+    const key={auth:'voiceKeyRejected',permission:'voicePermissionDenied',plan:'voicePlanRequired',quota:'voiceCreditsNeeded',voice_limit:'voiceLimitReached',request_validation:'voiceRequestRejected',rate_limit:'voiceRateLimited'}[details.reason];
+    if(key)return t(key)+(details.attempts>=details.attempt_limit?' '+t(code==='voice_clone_failed'?'cloneRetryLimit':'sampleRetryLimit'):'');
+  }
+  if(code==='voice_clone_failed')return t(details.attempts>=details.attempt_limit?'cloneRetryLimit':'cloneFailed');
   if(['voice_preview_failed','invalid_voice_preview','preview_operation_failed'].includes(code)||error?.message==='empty_preview')return t('sampleFailed');
   if(message.includes('verification'))return t('verificationPending');
   if(message.includes('unknown')||message.includes('dispatching')||message.includes('reconcile'))return t('outcomePending');
