@@ -38,11 +38,14 @@ jobs:
         run: node tests/wav_encoder.mjs
       - name: Enrollment capture and recovery assertions
         run: node tests/enrollment_capture.mjs
+      - name: Conversation event and learning contract assertions
+        run: node tests/conversation_events.mjs
       - name: Syntax-check enrollment browser modules
         run: |
           node --check studio/static/enroll.js
           node --check studio/static/vapi-frame.js
           for module in studio/static/enrollment-*.js; do node --check "$module"; done
+          for module in studio/static/conversation-*.js studio/static/learning-api.js; do node --input-type=module --check < "$module"; done
       - name: Install synthetic browser test dependencies
         run: |
           python -m pip install -r requirements-browser.txt
