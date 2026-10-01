@@ -312,6 +312,7 @@ def main():
             page = context.new_page()
             page.set_default_timeout(10000)
             errors, external_requests, csp_errors, frame_headers = [], [], [], []
+            session_create_requests = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.on("console", lambda item: csp_errors.append(item.text) if item.type == "error" and "Content Security Policy" in item.text else None)
             page.on("dialog", lambda dialog: dialog.accept())
@@ -328,6 +329,8 @@ def main():
                     route.fulfill(status=200, content_type="application/javascript", body=FAKE_DAILY)
                     return
                 path = parsed.path + ("?" + parsed.query if parsed.query else "")
+                if request.method == "POST" and parsed.path == "/api/enrollment/sessions":
+                    session_create_requests.append(request.url)
                 response = client.request(request.method, path, headers=request.all_headers(), content=request.post_data_buffer)
                 if parsed.path == "/vapi-frame":
                     assert "authorization" not in request.all_headers(), "Owner access must not be passed into the call frame"
@@ -567,10 +570,42 @@ def main():
                 assert not voice_only.assistants and not voice_only.preview_calls
                 assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
                 page.screenshot(path=str(output / "enrollment-voice-only-en.png"), full_page=True)
+
+                # An exhausted, already closed interview offers fresh consent,
+                # not a disabled Continue button or an implicit new recording.
+                stamp = enrollment.now()
+                app.state.store.execute("INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)", (
+                    "synthetic-exhausted-operation", voice_session, "realtime_call", "synthetic-exhausted-call",
+                    "succeeded", "rtc_synthetic_exhausted", json.dumps({"consumed_seconds": 1800}), stamp, stamp,
+                ))
+                app.state.store.execute("INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?)", (
+                    voice_session, "rtc_synthetic_exhausted", "closed", stamp, stamp,
+                ))
+                journey = client.get("/api/enrollment/sessions/" + voice_session + "/journey", headers=owner_headers).json()
+                assert journey["resume_limit"] == "time" and journey["can_resume"] is False
+                page.locator("#returnInterview").click()
+                expect(page.locator("#newInterview")).to_be_visible()
+                expect(page.locator("#newInterview")).to_be_enabled()
+                expect(page.locator("#connect")).to_be_hidden()
+                sessions_before = app.state.store.one("SELECT COUNT(*) AS n FROM enrollment_sessions")["n"]
+                requests_before = len(session_create_requests)
+                microphones_before = page.evaluate("window.__syntheticMedia.requested")
+                provider_before = (len(voice_only.opened), len(voice_only.closed), len(voice_only.clone_calls), len(voice_only.speech_calls), len(voice_only.assistants), len(voice_only.preview_calls))
+                page.locator("#newInterview").click()
+                expect(page.locator("#consentForm")).to_be_visible()
+                expect(page.locator("#consentForm input[type=checkbox]")).to_have_count(5)
+                for selector in ("#own", "#record", "#external", "#clone", "#preview"):
+                    expect(page.locator(selector)).not_to_be_checked()
+                assert len(session_create_requests) == requests_before
+                assert app.state.store.one("SELECT COUNT(*) AS n FROM enrollment_sessions")["n"] == sessions_before
+                assert page.evaluate("window.__syntheticMedia.requested") == microphones_before
+                assert page.evaluate("window.__syntheticMedia.active") == 0
+                assert provider_before == (len(voice_only.opened), len(voice_only.closed), len(voice_only.clone_calls), len(voice_only.speech_calls), len(voice_only.assistants), len(voice_only.preview_calls))
+                page.screenshot(path=str(output / "enrollment-fresh-consent-en.png"), full_page=True)
                 assert not errors, errors
                 assert not csp_errors, csp_errors
                 assert not external_requests, external_requests
-                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, one-action interview recovery, trusted evidence, decoded audio, one-action voice preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, voice preparation without behavior/Vapi, mobile overflow and CSP.")
+                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, one-action interview recovery, trusted evidence, decoded audio, one-action voice preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, voice preparation without behavior/Vapi, exhausted-interview fresh consent, mobile overflow and CSP.")
                 print("Generated tones and private synthetic provider events only: no physical microphone, real provider call, real voice clone, or human voice-quality acceptance was tested.")
             except Exception:
                 page.screenshot(path=str(output / "enrollment-failure.png"), full_page=True)

@@ -88,9 +88,9 @@ export const copy = {
     "revokedTitle": "Consent withdrawn.",
     "revokedText": "Local use is blocked. Provider deletion may still need review.",
     "reviewNeeded": "Your saved work needs review before continuing.",
-    "previousOpen": "The previous connection needs to end before you continue.",
+    "previousOpen": "Choose Continue talking to reconnect.",
     "endPrevious": "End previous connection",
-    "closeUnknown": "Microphone off. Retry ending the previous connection to continue.",
+    "closeUnknown": "Microphone off. Choose Continue talking to reconnect.",
     "off": "Microphone off",
     "active": "Listening",
     "connecting": "Connecting",
@@ -191,7 +191,8 @@ export const copy = {
     "noSpeechSaved": "Talk to the interviewer first.",
     "callAway": "End the test before leaving.",
     "preparingBackground": "Please wait for preparation to finish.",
-    "interviewLimit": "This interview reached its limit. You can still choose Hear my voice.",
+    "newInterview": "Start a new conversation",
+    "interviewLimit": "This interview reached its limit. Hear your voice or start a new conversation.",
     "enableSound": "Enable sound"
   },
   "ar": {
@@ -283,9 +284,9 @@ export const copy = {
     "revokedTitle": "تم سحب الموافقة.",
     "revokedText": "الاستخدام المحلي متوقّف. الحذف عند المزوّدين قد يحتاج مراجعة.",
     "reviewNeeded": "شغلك المحفوظ يحتاج مراجعة قبل المتابعة.",
-    "previousOpen": "يلزم إنهاء الاتصال السابق قبل المتابعة.",
+    "previousOpen": "اختار «كمّل الحكي» لإعادة الاتصال.",
     "endPrevious": "إنهاء الاتصال السابق",
-    "closeUnknown": "الميكروفون مطفأ. أعد إنهاء الاتصال السابق حتى تكمّل.",
+    "closeUnknown": "الميكروفون مطفأ. اختار «كمّل الحكي» لإعادة الاتصال.",
     "off": "الميكروفون مطفأ",
     "active": "بنسمعك",
     "connecting": "جاري الاتصال",
@@ -386,7 +387,8 @@ export const copy = {
     "noSpeechSaved": "احكِ مع المحاوِر أولاً.",
     "callAway": "أنْهِ التجربة قبل المغادرة.",
     "preparingBackground": "انتظر اكتمال التجهيز.",
-    "interviewLimit": "وصلت المقابلة لحدّها. تقدر تختار «اسمع صوتي» من تسجيلك المحفوظ.",
+    "newInterview": "أبدأ محادثة جديدة",
+    "interviewLimit": "وصلت المحادثة لحدّها. اسمع صوتك أو ابدأ محادثة جديدة.",
     "enableSound": "تشغيل الصوت"
   }
 };

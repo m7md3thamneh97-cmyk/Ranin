@@ -181,3 +181,84 @@ def test_chunk_above_256_kib_is_rejected_before_storage(env, monkeypatch):
     response = client.put(f'/api/enrollment/sessions/{sid}/chunks/0', headers=headers, content=audio)
     assert response.status_code == 413
     assert not app.state.store.all('SELECT * FROM enrollment_chunks WHERE session_id=?', (sid,))
+
+
+def explicitly_consented_start(client, owner):
+    return client.post('/api/enrollment/sessions', headers=auth(owner), json={
+        'recording': True, 'external_processing': True, 'voice_cloning': True,
+        'private_preview': True, 'self_attestation': True,
+    })
+
+
+@pytest.mark.parametrize('attempts,consumed_seconds', [(1, 1800), (30, 300)])
+def test_new_consent_after_exhausted_closed_interview_preserves_previous_session(env, monkeypatch, attempts, consumed_seconds):
+    client, app, owner, _, _ = env
+    enable(monkeypatch)
+    old_sid = start(client, owner)
+    assert upload(client, owner, old_sid, 0, duration=1000).status_code == 200
+    for index in range(attempts):
+        app.state.store.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)',
+                                (uid(), old_sid, 'realtime_call', f'finished-attempt-{index}', 'succeeded',
+                                 f'rtc_finished_{index}', json.dumps({'consumed_seconds': consumed_seconds if index == 0 else 0}), now(), now()))
+    app.state.store.execute('INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?)',
+                            (old_sid, 'rtc_finished_last', 'closed', now(), now()))
+    before = app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (old_sid,))
+    old_chunks = app.state.store.all('SELECT * FROM enrollment_chunks WHERE session_id=?', (old_sid,))
+    old_operations = app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=? ORDER BY id', (old_sid,))
+
+    response = explicitly_consented_start(client, owner)
+    assert response.status_code == 201
+    assert response.json()['resumed'] is False
+    new_sid = response.json()['id']
+    assert new_sid != old_sid
+    assert app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (old_sid,)) == before
+    assert app.state.store.all('SELECT * FROM enrollment_chunks WHERE session_id=?', (old_sid,)) == old_chunks
+    assert app.state.store.all('SELECT * FROM enrollment_operations WHERE session_id=? ORDER BY id', (old_sid,)) == old_operations
+    fresh = app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (new_sid,))
+    assert fresh['owner_id'] == owner['id'] and fresh['state'] == 'collecting'
+    assert fresh['voice_id'] is None and fresh['total_bytes'] == 0
+    assert all(json.loads(fresh['consent_json'])[scope] for scope in
+               ('recording', 'external_processing', 'voice_cloning', 'private_preview', 'self_attestation'))
+
+
+@pytest.mark.parametrize('call_state', ['open', 'dispatching', 'close_unknown', 'outcome_unknown'])
+def test_exhausted_interview_with_unresolved_call_cannot_create_replacement(env, monkeypatch, call_state):
+    client, app, owner, _, _ = env
+    enable(monkeypatch)
+    old_sid = start(client, owner)
+    app.state.store.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)',
+                            (uid(), old_sid, 'realtime_call', 'exhausted-prior-call', 'succeeded',
+                             'rtc_exhausted_prior', json.dumps({'consumed_seconds': 1800}), now(), now()))
+    app.state.store.execute('INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?)',
+                            (old_sid, 'rtc_unresolved', call_state, now(), now()))
+    before = app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (old_sid,))
+
+    response = explicitly_consented_start(client, owner)
+    assert response.status_code == 201
+    assert response.json() == {'id': old_sid, 'resumed': True}
+    assert app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (old_sid,)) == before
+    assert app.state.store.one('SELECT COUNT(*) AS n FROM enrollment_sessions WHERE owner_id=?', (owner['id'],))['n'] == 1
+    journey = client.get(f'/api/enrollment/sessions/{old_sid}/journey', headers=auth(owner)).json()
+    assert journey['can_resume'] is False
+
+
+@pytest.mark.parametrize('operation_kind', ['voice_clone', 'vapi_assistant'])
+def test_exhausted_closed_interview_with_unknown_provider_operation_is_reused(env, monkeypatch, operation_kind):
+    client, app, owner, _, _ = env
+    enable(monkeypatch)
+    old_sid = start(client, owner)
+    app.state.store.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)',
+                            (uid(), old_sid, 'realtime_call', 'exhausted-completed-call', 'succeeded',
+                             'rtc_exhausted_closed', json.dumps({'consumed_seconds': 1800}), now(), now()))
+    app.state.store.execute('INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?)',
+                            (old_sid, 'rtc_exhausted_closed', 'closed', now(), now()))
+    app.state.store.execute('INSERT INTO enrollment_operations VALUES(?,?,?,?,?,?,?,?,?)',
+                            (uid(), old_sid, operation_kind, 'uncertain-provider-operation', 'outcome_unknown',
+                             None, '{}', now(), now()))
+    before = app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (old_sid,))
+
+    response = explicitly_consented_start(client, owner)
+    assert response.status_code == 201
+    assert response.json() == {'id': old_sid, 'resumed': True}
+    assert app.state.store.one('SELECT * FROM enrollment_sessions WHERE id=?', (old_sid,)) == before
+    assert app.state.store.one('SELECT COUNT(*) AS n FROM enrollment_sessions WHERE owner_id=?', (owner['id'],))['n'] == 1
