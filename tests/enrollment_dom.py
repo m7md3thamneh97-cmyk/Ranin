@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import base64
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -140,6 +141,7 @@ class SyntheticProvider:
     def __init__(self):
         self.opened = []
         self.closed = []
+        self.interview_close_failures = 0
         self.clone_calls = []
         self.speech_calls = []
         self.assistants = []
@@ -153,6 +155,7 @@ class SyntheticProvider:
     async def openai_create_call(self, api_key, safety_id, sdp, session):
         assert api_key == "synthetic-openai-key"
         assert safety_id and sdp.startswith("v=0") and session["type"] == "realtime"
+        assert not self.opened or self.opened[-1] in self.closed, "Close the known previous interview before opening a replacement"
         call_id = f"rtc_synthetic_ui_{len(self.opened) + 1}"
         self.opened.append(call_id)
         return {"call_id": call_id, "sdp": "v=0\r\ns=synthetic-answer\r\n"}
@@ -160,6 +163,9 @@ class SyntheticProvider:
     async def openai_hangup(self, api_key, call_id):
         assert api_key == "synthetic-openai-key"
         assert call_id in self.opened
+        if self.interview_close_failures:
+            self.interview_close_failures -= 1
+            raise enrollment.ProviderError("Synthetic unknown interview hangup outcome", uncertain=True)
         self.closed.append(call_id)
 
     async def eleven_clone(self, api_key, name, files):
@@ -347,7 +353,7 @@ def main():
             def pause_saved():
                 page.locator("#pause").click()
                 page.wait_for_function("window.__syntheticMedia.active === 0")
-                expect(page.locator("#uploadState")).to_have_text("All completed audio pieces have been acknowledged as saved.")
+                expect(page.locator("#uploadState")).to_have_text("Audio saved.")
                 expect(page.locator("#connect")).to_be_enabled()
                 expect(page.locator("#pause")).to_be_hidden()
 
@@ -376,11 +382,15 @@ def main():
                 page.locator("#connect").click()
                 expect(page.locator("#orb")).to_have_class(re.compile(r"\blive\b"))
                 page.wait_for_function("window.__syntheticMedia.recorders.some(r => r.state === 'recording')")
-                pause_saved()
-                assert len(fake.opened) == len(fake.closed) == 1
+                fake.interview_close_failures = 1
+                with page.expect_response("**/webrtc-close") as closing_interview:
+                    pause_saved()
+                assert closing_interview.value.status == 502
+                assert len(fake.opened) == 1 and not fake.closed
                 sessions = app.state.store.all("SELECT * FROM enrollment_sessions")
                 assert len(sessions) == 1
                 session_id = sessions[0]["id"]
+                assert app.state.store.one("SELECT state FROM enrollment_realtime_calls WHERE session_id=?", (session_id,))["state"] == "close_unknown"
                 chunks = app.state.store.all("SELECT seq FROM enrollment_chunks WHERE session_id=? ORDER BY seq", (session_id,))
                 assert [row["seq"] for row in chunks] == [0]
                 assert page.locator("iframe").count() == 0
@@ -391,14 +401,18 @@ def main():
                 expect(page.locator("html")).to_have_attribute("lang", "en")
                 expect(page.locator("html")).to_have_attribute("dir", "ltr")
                 sign_in_english()
-                expect(page.locator("#mainAction")).to_have_text("Continue my interview")
+                expect(page.locator("#mainAction")).to_have_text("Continue")
                 page.locator("#mainAction").click()
                 expect(page.locator("#connect")).to_be_enabled()
                 assert len(fake.opened) == 1, "Restoring a session must not automatically start a call"
                 assert page.evaluate("window.__syntheticMedia.active") == 0
                 assert page.evaluate("sessionStorage.length === 0 && Object.keys(localStorage).every(key => key === 'raneen-language') && localStorage.getItem('raneen-language') === 'en'"), "Only language preference may persist; owner token must remain memory-only"
+                # One primary action recovers a known unresolved server hangup.
+                # The contributor never has to expand the technical controls.
+                expect(page.locator("#endPrevious")).to_be_hidden()
                 page.locator("#connect").click()
                 expect(page.locator("#orb")).to_have_class(re.compile(r"\blive\b"))
+                assert fake.closed == [fake.opened[0]], "Continue must close the prior interview before starting a new call"
                 pause_saved()
                 chunks = app.state.store.all("SELECT seq FROM enrollment_chunks WHERE session_id=? ORDER BY seq", (session_id,))
                 assert [row["seq"] for row in chunks] == [0, 1], "Reload/resume must continue the server sequence"
@@ -418,8 +432,6 @@ def main():
                 # Complete the real preparation UI with synthetic provider audio.
                 # Playback is muted; real HTML audio decoding/ended events run.
                 page.locator("#finish").click()
-                expect(page.locator("#prepareAgent")).to_be_enabled()
-                page.locator("#prepareAgent").click()
                 expect(page.locator("#sample-question")).to_be_visible(timeout=30000)
                 expect(page.locator("#approveVoice")).to_be_disabled()
                 assert len(fake.clone_calls) == 1
@@ -475,7 +487,6 @@ def main():
                 expect(page.locator("#orb")).to_have_class(re.compile(r"\blive\b"))
                 pause_saved()
                 page.locator("#finish").click()
-                page.locator("#prepareAgent").click()
                 expect(page.locator("#startTest")).to_be_enabled(timeout=30000)
                 assert len(fake.clone_calls) == 1, "A spoken response correction must reuse the approved voice"
                 assert len(fake.speech_calls) == 3, "A behavior-only correction must not regenerate the voice samples"
@@ -509,7 +520,7 @@ def main():
                 page.reload()
                 expect(page.locator("html")).to_have_attribute("lang", "en")
                 sign_in_english()
-                expect(page.locator("#mainAction")).to_have_text("View saved interview")
+                expect(page.locator("#mainAction")).to_have_text("View")
                 page.locator("#mainAction").click()
                 expect(page.locator("#startTest")).to_be_disabled()
                 expect(page.locator("#revoke")).to_be_visible()
@@ -522,10 +533,44 @@ def main():
                 assert len(app.state.store.all("SELECT * FROM enrollment_voice_versions")) == 1
                 assert fake.deleted_voices == ["voice_synthetic_ui_123"]
                 assert set(fake.deleted_assistants) == {item[0] for item in fake.assistants}
+
+                # A saved recording can produce the first voice samples before
+                # any response pattern is confirmed or Vapi is configured.
+                # Seed only acknowledged synthetic audio through the private API.
+                os.environ["RANEEN_VOICE_ENROLLMENT_ENABLED"] = "1"
+                os.environ.pop("VAPI_API_KEY")
+                os.environ.pop("RANEEN_VAPI_TEMPLATE_ID")
+                voice_only = SyntheticProvider()
+                app.state.enrollment_provider = voice_only
+                owner_headers = {"Authorization": "Bearer " + owner["token"], "Origin": ORIGIN}
+                created = client.post("/api/enrollment/sessions", headers=owner_headers, json={
+                    "self_attestation": True, "recording": True, "external_processing": True,
+                    "voice_cloning": True, "private_preview": True,
+                })
+                assert created.status_code == 201
+                voice_session = created.json()["id"]
+                uploaded = client.put("/api/enrollment/sessions/" + voice_session + "/chunks/0", content=capture_audio, headers=owner_headers | {
+                    "Content-Type": "audio/webm", "X-Speaker-Role": "contributor",
+                    "X-Chunk-Sha256": hashlib.sha256(capture_audio).hexdigest(), "X-Duration-Ms": "1000",
+                })
+                assert uploaded.status_code == 200
+                assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
+                page.reload()
+                sign_in_english()
+                page.locator("#mainAction").click()
+                page.locator("#finish").click()
+                expect(page.locator("#sample-question")).to_be_visible(timeout=30000)
+                expect(page.locator("#sample-number")).to_be_visible()
+                expect(page.locator("#sample-correction")).to_be_visible()
+                expect(page.locator("#approveVoice")).to_be_disabled()
+                assert len(voice_only.clone_calls) == 1 and len(voice_only.speech_calls) == 3
+                assert not voice_only.assistants and not voice_only.preview_calls
+                assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
+                page.screenshot(path=str(output / "enrollment-voice-only-en.png"), full_page=True)
                 assert not errors, errors
                 assert not csp_errors, csp_errors
                 assert not external_requests, external_requests
-                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, capture/recovery, trusted evidence, decoded audio, preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, mobile overflow and CSP.")
+                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, one-action interview recovery, trusted evidence, decoded audio, one-action voice preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, voice preparation without behavior/Vapi, mobile overflow and CSP.")
                 print("Generated tones and private synthetic provider events only: no physical microphone, real provider call, real voice clone, or human voice-quality acceptance was tested.")
             except Exception:
                 page.screenshot(path=str(output / "enrollment-failure.png"), full_page=True)

@@ -144,6 +144,30 @@ def test_ogg_is_decoded(tmp_path, decoder):
     assert metrics['duration_ms'] == 1000
 
 
+def test_delayed_recorder_blob_over_80kib_is_decoded_and_selected(tmp_path, decoder):
+    # A delayed MediaRecorder stop can yield more than a nominal 3 s segment.
+    # Keep the browser's 128 kbps encoding rate and validate actual duration.
+    result = subprocess.run(
+        ['ffmpeg', '-v', 'error', '-f', 'wav', '-i', 'pipe:0',
+         '-c:a', 'libopus', '-b:a', '128k', '-vbr', 'off', '-f', 'webm', 'pipe:1'],
+        input=wav_bytes(8000), capture_output=True, check=True,
+    )
+    data = result.stdout
+    assert 80 * 1024 < len(data) <= audio.CHUNK_MAX_BYTES
+    source = chunk(tmp_path, data=data, mime='audio/webm', claimed_ms=3000)
+    metrics = audio.validate_audio_chunk(
+        Path(source['path']), mime=source['mime'], expected_sha256=source['sha256'],
+    )
+    assert metrics['duration_ms'] == 8000
+    assert metrics['usable_for_clone']
+    files, manifest = audio.prepare_clone_sample(
+        [source], tmp_path / 'samples', min_active_ms=7000,
+    )
+    assert len(files) == 1
+    assert manifest['total_ms'] == 8000
+    assert manifest['chunks'][0]['sha256'] == source['sha256']
+
+
 def test_sample_is_deterministic_and_bad_segments_excluded(tmp_path, decoder):
     sources = [chunk(tmp_path), chunk(tmp_path, 1, data=b'invalid'), chunk(tmp_path, 2, data=wav_bytes(silence=True)), chunk(tmp_path, 3)]
     files, manifest = audio.prepare_clone_sample(sources, tmp_path / 'samples', min_active_ms=1500)

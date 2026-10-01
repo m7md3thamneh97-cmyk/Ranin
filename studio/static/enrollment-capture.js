@@ -70,10 +70,13 @@ export class InterviewCapture {
     this.pausing = null;
     this.finalChunk = Promise.resolve();
     this.unsavedFinal = null;
+    this.missingFinals = new Set();
     this.uncertainTail = false;
     this.queue = new ChunkQueue({sessionId, nextSeq, upload, hash, timeoutMs, onAck, onChange: () => this.onState(this)});
   }
   get hasPending() { return this.queue.hasPending || Boolean(this.unsavedFinal) || this.uncertainTail; }
+  get uncertainTail() { return this._uncertainTail || this.missingFinals.size > 0; }
+  set uncertainTail(value) { this._uncertainTail = value; if (!value) this.missingFinals.clear(); }
   setState(value) { this.state = value; this.onState(this); }
   mimeType() {
     for (const mime of ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"]) {
@@ -179,7 +182,7 @@ export class InterviewCapture {
     let segmentTimer;
     this.recorder = recorder;
     let finish;
-    this.finalChunk = new Promise((resolve) => { finish = resolve; });
+    const final = this.finalChunk = new Promise((resolve) => { finish = resolve; });
     recorder.ondataavailable = (event) => { if (event.data?.size) parts.push(event.data); };
     recorder.onerror = () => { this.uncertainTail = true; this.pause().then(() => this.onError(new Error("recording_failed"))).catch(this.onError); };
     recorder.onstop = () => {
@@ -204,7 +207,7 @@ export class InterviewCapture {
         this.unsavedFinal = {blob, durationMs};
         this.onError(error);
         this.pause().catch(this.onError);
-      } finally { finish(); }
+      } finally { this.missingFinals.delete(final); finish(); this.onState(this); }
       if (this.recording && this.recorder === recorder && epoch === this.epoch) this.startSegment(mime);
     };
     try { recorder.start(); }
@@ -255,7 +258,7 @@ export class InterviewCapture {
     const finish = async () => {
       try {
         await Promise.race([final, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("final_audio_pending")), 3000); })]);
-      } catch (error) { this.uncertainTail = true; this.onError(error); }
+      } catch (error) { this.missingFinals.add(final); this.onError(error); }
       finally { clearTimeout(timer); }
       const saved = save ? await this.queue.flush() : false;
       await hangup;
