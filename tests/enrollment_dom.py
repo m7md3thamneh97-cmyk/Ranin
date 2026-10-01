@@ -720,6 +720,8 @@ def main():
                 ))
                 journey = client.get("/api/enrollment/sessions/" + voice_session + "/journey", headers=owner_headers).json()
                 assert journey["resume_limit"] == "time" and journey["can_resume"] is False
+                page.locator("details:has(#refresh) > summary").click()
+                expect(page.locator("#refresh")).to_be_visible()
                 page.locator("#refresh").click()
                 expect(page.locator("#newInterview")).to_be_visible()
                 expect(page.locator("#newInterview")).to_be_enabled()
