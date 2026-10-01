@@ -691,7 +691,7 @@ def main():
                 expect(page.locator("#orb")).to_have_class(re.compile(r"\blive\b"))
                 expect(page.locator("#spokenReview")).to_be_visible()
                 expect(page.locator("#spokenReview")).to_contain_text("Yes, save this")
-                expect(page.locator("#spokenReview")).to_contain_text("نعم احفظ هذا")
+                expect(page.locator("#spokenReview")).to_contain_text("After you hear the whole summary")
                 assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
                 app.state.enrollment_sideband.confirm_pending()
                 page.evaluate("window.__syntheticMedia.peer.channel.onmessage({data:JSON.stringify({type:'response.done'})})")
