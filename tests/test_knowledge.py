@@ -53,6 +53,22 @@ def test_document_version_is_idempotent_and_new_version_supersedes_old_facts(tmp
     assert again["idempotent"] is True
     assert again["document_version_id"] == first["document_version_id"]
 
+    conflicting_retry = client.post(
+        "/api/knowledge/documents",
+        headers=auth(owner),
+        json={
+            "source_type": "google_drive",
+            "external_id": "drive-file-1",
+            "version_key": "2026-09-01T10:00:00Z",
+            "name": "Project X.pdf",
+            "source_uri": "https://drive.google.com/file/d/drive-file-1",
+            "mime_type": "application/pdf",
+            "size_bytes": 99999,
+            "metadata": {"folder": "Raneen Source Data"},
+        },
+    )
+    assert conflicting_retry.status_code == 409
+
     entity = client.post(
         "/api/knowledge/entities",
         headers=auth(owner),
@@ -178,18 +194,20 @@ def test_chunk_search_and_visual_asset_keep_source_provenance(tmp_path):
         },
     )
     assert chunk.status_code == 201
-    asset = client.post(
-        "/api/knowledge/assets",
-        headers=auth(owner),
-        json={
-            "document_version_id": document["document_version_id"],
-            "unit_id": unit["id"],
-            "asset_type": "location_map",
-            "source_locator": "slide:8#map-1",
-            "summary": "Map used as evidence for location relationships.",
-        },
-    )
+    asset_payload = {
+        "document_version_id": document["document_version_id"],
+        "unit_id": unit["id"],
+        "asset_type": "location_map",
+        "source_locator": "slide:8#map-1",
+        "summary": "Map used as evidence for location relationships.",
+    }
+    asset = client.post("/api/knowledge/assets", headers=auth(owner), json=asset_payload)
     assert asset.status_code == 201
+    assert asset.json()["idempotent"] is False
+    repeated_asset = client.post("/api/knowledge/assets", headers=auth(owner), json=asset_payload)
+    assert repeated_asset.status_code == 201
+    assert repeated_asset.json()["id"] == asset.json()["id"]
+    assert repeated_asset.json()["idempotent"] is True
 
     search = client.get(
         "/api/knowledge/search",
