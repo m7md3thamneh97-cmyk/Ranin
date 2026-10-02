@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111918">
+  <title>رنين · صوتك، أسلوبك</title>
+  <link rel="stylesheet" href="/static/become.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Raneen"><span class="brand-mark" aria-hidden="true">ر</span><span data-copy="brand">رنين</span></a>
+      <button class="language" id="language" type="button" lang="en">English</button>
+    </header>
+    <main id="experience" data-state="IDLE" aria-busy="false">
+      <p class="eyebrow" data-copy="eyebrow">ممثّلك العقاري، بطريقتك</p>
+      <h1 id="headline" data-copy="headline">صوتك. أسلوبك.</h1>
+      <p class="intro" id="intro" data-copy="intro">اصنع ممثّلاً عقارياً بالذكاء الاصطناعي يتعلّم منك، بصوتك وأسلوب حديثك.</p>
+      <div class="orb-scene" aria-hidden="true"><div class="orb-halo"></div><div class="orb"><div class="orb-inner"></div><div class="orb-glint"></div></div><div class="orbit"></div></div>
+      <div class="conversation-status" role="status" aria-live="polite" aria-atomic="true"><span class="status-dot" aria-hidden="true"></span><span id="status" data-copy="initial">ابدأ محادثة. كن على طبيعتك.</span></div>
+      <p class="detail" id="detail" data-copy="detail">كلّمه كما تكلّم عميلك. سيتعلّم صوتك، كلماتك، وطريقتك في الرد.</p>
+      <div class="start-controls" id="startControls">
+        <label class="consent"><input id="consent" type="checkbox"><span data-copy="consent">هذا صوتي. أوافق على تسجيله ومعالجته خارجياً واستنساخه لتجربة خاصة بالذكاء الاصطناعي.</span></label>
+        <button class="primary" id="create" type="button" disabled><span data-copy="create">اصنع ممثّلي</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+        <p class="privacy" data-copy="privacy">تبدأ بصوت مؤقّت، ثم يتحوّل إلى صوتك عند توفّر عيّنة مناسبة. يمكنك التوقّف وحذف الجلسة في أي وقت.</p>
+      </div>
+      <div class="live-controls" id="liveControls" hidden>
+        <p class="speech-progress" id="progress"></p>
+        <div class="saved-voice" id="savedVoice" hidden><p data-copy="savedVoice">استمع إلى عيّنة جديدة بصوتك</p><audio id="voicePreview" controls preload="none"></audio></div>
+        <button class="sound" id="sound" type="button" hidden data-copy="sound">تشغيل الصوت</button>
+        <button class="stop" id="stop" type="button"><span class="stop-mark" aria-hidden="true"></span><span data-copy="stop">إنهاء المحادثة</span></button>
+        <button class="text-action" id="revoke" type="button" data-copy="revoke">حذف الجلسة وصوتي</button>
+      </div>
+      <p class="privacy" id="retention" data-copy="retention">يبقى صوتك وعيّنته متاحين في هذا المتصفّح لمدة 7 أيام، ثم يُجدول حذفهما تلقائياً. يمكنك طلب الحذف قبل ذلك.</p>
+      <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
+      <details class="diagnostics" id="diagnostics" hidden><summary>Development diagnostics</summary><pre id="debug"></pre></details>
+    </main>
+    <footer><span data-copy="footer">محادثة واحدة. يصبح أقرب إليك.</span><a href="/enroll" data-copy="studio">الاستوديو</a></footer>
+  </div>
+  <noscript>فعّل JavaScript لبدء المحادثة. Enable JavaScript to start your conversation.</noscript>
+  <script src="/static/vendor/daily-0.87.0.js"></script>
+  <script type="module" src="/static/become.js"></script>
+</body>
+</html>
