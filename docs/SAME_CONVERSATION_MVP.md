@@ -38,8 +38,19 @@ another clone create.
 A provider voice ID alone is insufficient. ElevenLabs verification requirements
 block use; a fresh synthesized sample must decode successfully before readiness.
 Handoff dispatch preserves the actual Vapi call ID and uses full conversation
-context. Dispatch acceptance remains SWITCHING. CLONED_ACTIVE requires an
-authenticated provider speech event identifying that same call and cloned voice.
+context. Dispatch acceptance remains SWITCHING. The cloned destination receives
+its own callback URL (`/api/becoming/provider/{session}/cloned`) and credential,
+distinct from the bootstrap callback. Additive migration 012 records only the
+destination credential hash; already applied migrations 010 and 011 are unchanged.
+CLONED_ACTIVE requires a provider speech event authenticated through that exact
+destination route after a known call, verified synthesis and committed handoff
+dispatch. Minimal events can omit call/voice metadata; the destination credential
+then binds them to this session's recorded call and configured clone. Supplied
+conflicting call/voice metadata is rejected. Late bootstrap events never activate
+the clone, and callback confirmation can precede the control HTTP acknowledgement.
+The evidence establishes the provider's configured destination and speech event,
+not acoustic voice identity, actual playback or human acceptance. Applying the new
+callback URL/headers during a real inline handoff remains a live verification step.
 The destination has an empty greeting and instructions to continue the exchange.
 
 Observed user wording, language, code switching and turn length inform limited

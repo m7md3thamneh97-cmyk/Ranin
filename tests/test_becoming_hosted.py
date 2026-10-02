@@ -51,6 +51,8 @@ def test_public_capability_api_never_opens_owner_apis(tmp_path, monkeypatch):
         assert client.get('/api/becoming/sessions/' + ident,
                           headers={'Authorization': 'Bearer invalid-fixture'}).status_code == 401
         assert client.get('/api/becoming/sessions/' + '1' * 32).status_code == 401
+        for suffix in ('', '/cloned', '/cloned-extra', '/cloned/more'):
+            assert client.post('/api/becoming/provider/' + ident + suffix, json={'message': {}}, headers={'Origin': ORIGIN}).status_code == 401
 
 
 def test_start_requires_explicit_consent_and_same_origin(tmp_path, monkeypatch):
@@ -72,9 +74,9 @@ def test_additive_install_preserves_existing_evidence(tmp_path, monkeypatch):
                              ('a' * 32, user['id'], 'Synthetic profile', 'Gulf Arabic', 'both', 'fixture', '2026-01-01'))
     app = create_app(tmp_path, public_origin=ORIGIN, owner_only=True)
     assert app.state.store.one('SELECT name FROM profiles WHERE id=?', ('a' * 32,))['name'] == 'Synthetic profile'
-    assert [item['version'] for item in app.state.store.all('SELECT version FROM becoming_schema_versions ORDER BY version')] == [10, 11]
+    assert [item['version'] for item in app.state.store.all('SELECT version FROM becoming_schema_versions ORDER BY version')] == [10, 11, 12]
     repeated = create_app(tmp_path, public_origin=ORIGIN, owner_only=True)
-    assert [item['version'] for item in repeated.state.store.all('SELECT version FROM becoming_schema_versions ORDER BY version')] == [10, 11]
+    assert [item['version'] for item in repeated.state.store.all('SELECT version FROM becoming_schema_versions ORDER BY version')] == [10, 11, 12]
 
 
 def test_previous_enrollment_flag_cannot_enable_anonymous_calls(tmp_path, monkeypatch):

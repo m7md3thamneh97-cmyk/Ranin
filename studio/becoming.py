@@ -92,13 +92,17 @@ class Event(Strict):
     active_assistant_voice: dict | None = None
     event_at_ms: int | None = Field(default=None, ge=0)
     event_time_source: Literal['provider_timestamp', 'server_receipt'] | None = None
+    callback_route: Literal['bootstrap', 'cloned_destination'] | None = None
+    identity_evidence: Literal['destination_callback_credential'] | None = None
+    call_identity_evidence: Literal['supplied_call_id', 'scoped_callback_credential'] | None = None
 
 
 def apply_migration(store):
     with store.db() as db:
         db.execute('BEGIN IMMEDIATE')
         db.execute('CREATE TABLE IF NOT EXISTS becoming_schema_versions(version INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, applied TEXT NOT NULL)')
-        for version, filename in ((10, '010_becoming.sql'), (11, '011_becoming_retention.sql')):
+        for version, filename in ((10, '010_becoming.sql'), (11, '011_becoming_retention.sql'),
+                                  (12, '012_becoming_destination_callback.sql')):
             raw = (Path(__file__).parent / 'sql' / filename).read_bytes()
             digest = hashlib.sha256(raw).hexdigest()
             previous = db.execute('SELECT sha256 FROM becoming_schema_versions WHERE version=?', (version,)).fetchone()
@@ -213,7 +217,7 @@ class BecomingService:
                 'retention_expires_at': row.get('retention_expires_at'),
                 'operations': operations, 'next_sequence': len(self.store.all('SELECT seq FROM becoming_chunks WHERE session_id=?', (ident,))),
                 'measurement': 'Measured PCM duration inside client-reported user-speech windows. Signal energy is not speech or speaker verification.',
-                'activation_evidence': 'Provider-authenticated route and speech events are required for CLONED_ACTIVE.',
+                'activation_evidence': 'Provider-authenticated destination callback and speech events establish the configured route. They do not establish acoustic voice identity or human acceptance.',
                 'style_profile': self.profile(ident)}
 
     def claim(self, ident, kind, key, *, allow_terminal=False):
@@ -243,6 +247,20 @@ class BecomingService:
         diagnostics = sanitize_diagnostics(getattr(exc, 'diagnostics', None))
         if diagnostics:
             detail['provider_diagnostics'] = diagnostics
+        if stage == 'handoff':
+            current = self.current(ident, active=False)
+            telemetry = json.loads(current['telemetry'])
+            if telemetry.get('handoff_evidence_source') == 'provider_destination_callback':
+                # A destination event can race ahead of the HTTP response. Confirmed route
+                # evidence wins over a missing/failed control acknowledgement.
+                if operation:
+                    stored = self.store.one('SELECT detail FROM becoming_operations WHERE id=?', (operation['id'],))
+                    confirmed = json.loads(stored['detail']) if stored else {}
+                    confirmed.update({'voice_id': current['voice_id'], 'completion_evidence': 'provider_destination_callback',
+                                      'control_acknowledgement_error': reason})
+                    self.finish(operation, 'succeeded', current['call_id'], confirmed)
+                self.telemetry(ident, handoff_control_acknowledgement_error=reason)
+                return
         if operation:
             self.finish(operation, 'outcome_unknown' if uncertain else 'failed', detail=detail)
         state = {'clone': 'CLONE_UNKNOWN' if uncertain else 'CLONE_FAILED',
@@ -437,13 +455,30 @@ class BecomingService:
             return self.snapshot(ident)
         try:
             base = json.loads(row['bootstrap_config'])
-            destination = cloned_assistant(base, row['voice_id'], self.profile(ident))
+            destination_secret = secrets.token_urlsafe(32)
+            destination = cloned_assistant(base, row['voice_id'], self.profile(ident),
+                webhook_url=(self.public_origin + '/api/becoming/provider/' + ident + '/cloned') if self.public_origin else None,
+                webhook_secret=destination_secret)
             self.current(ident)
-            self.store.execute("UPDATE becoming_sessions SET state='SWITCHING_VOICE',failure=NULL,updated=? WHERE id=? AND revoked_at IS NULL AND ended_at IS NULL", (now(), ident))
-            self.telemetry(ident, handoff_requested_at=now())
+            # Commit the destination credential with a live, known voice and the one claimed
+            # handoff. A fast destination callback may arrive before the control HTTP response.
+            with self.store.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current = db.execute('SELECT * FROM becoming_sessions WHERE id=?', (ident,)).fetchone()
+                if current['revoked_at'] or current['ended_at'] or current['expires_at'] < now() or not current['voice_ready'] or current['voice_id'] != row['voice_id']:
+                    raise HTTPException(410, 'The consented handoff is no longer active.')
+                if secrets.compare_digest(current['webhook_hash'], token_hash(destination_secret)):
+                    raise HTTPException(503, 'The destination callback could not be isolated.')
+                db.execute("UPDATE becoming_sessions SET state='SWITCHING_VOICE',failure=NULL,destination_webhook_hash=?,updated=? WHERE id=?", (token_hash(destination_secret), now(), ident))
+                telemetry = json.loads(current['telemetry'])
+                telemetry['handoff_requested_at'] = now(); telemetry['handoff_dispatch_started_at'] = now()
+                db.execute('UPDATE becoming_sessions SET telemetry=? WHERE id=?', (compact(telemetry), ident))
             await self.providers.vapi_control(row['control_url'], {'type': 'handoff', 'content': '',
                 'destination': {'type': 'assistant', 'assistant': destination, 'contextEngineeringPlan': {'type': 'all'}}})
-            self.finish(operation, 'succeeded', row['call_id'], {'voice_id': row['voice_id'], 'context': 'all', 'request_acknowledged': True})
+            stored = self.store.one('SELECT detail FROM becoming_operations WHERE id=?', (operation['id'],))
+            detail = json.loads(stored['detail']) if stored else {}
+            detail.update({'voice_id': row['voice_id'], 'context': 'all', 'request_acknowledged': True})
+            self.finish(operation, 'succeeded', row['call_id'], detail)
             # HTTP 2xx acknowledges a request, not a completed handoff or audible clone.
             self.telemetry(ident, handoff_request_acknowledged_at=now())
             self.current(ident)
@@ -483,25 +518,44 @@ class BecomingService:
                 raise HTTPException(410, 'Conversation consent is no longer active.')
             old = db.execute('SELECT payload,source FROM becoming_events WHERE session_id=? AND event_id=?', (ident, event.event_id)).fetchone()
             if old:
-                if old['payload'] != compact(payload) or old['source'] != source:
+                previous = json.loads(old['payload'])
+                comparison = dict(payload)
+                if source == 'provider_authenticated' and previous.get('event_time_source') == comparison.get('event_time_source') == 'server_receipt':
+                    # A retry of a turn-only event has a new receipt time. Preserve the
+                    # first receipt while comparing its immutable, credential-scoped evidence.
+                    previous.pop('event_at_ms', None); comparison.pop('event_at_ms', None)
+                if compact(previous) != compact(comparison) or old['source'] != source:
                     raise HTTPException(409, 'An event identifier was reused with different evidence.')
                 return {'accepted': True, 'duplicate': True, 'source': source}
             count = db.execute('SELECT COUNT(*) AS n FROM becoming_events WHERE session_id=?', (ident,)).fetchone()['n']
             if count >= 2000:
                 raise HTTPException(429, 'Conversation event capacity is used.')
             db.execute('INSERT INTO becoming_events VALUES(?,?,?,?,?,?)', (ident, event.event_id, source, event.type, compact(payload), now()))
-        if source == 'provider_authenticated' and row['voice_ready']:
+        destination_event = source == 'provider_authenticated' and event.callback_route == 'cloned_destination'
+        if destination_event and row['voice_ready']:
+            # The endpoint has checked the callback credential against this exact claimed
+            # handoff. Keep its confirmation even if the control request later times out.
+            handoff = self.store.one("SELECT * FROM becoming_operations WHERE session_id=? AND kind='handoff' AND op_key=?", (ident, row['voice_id']))
+            def confirmed_route():
+                if handoff:
+                    detail = json.loads(handoff['detail'])
+                    detail.update({'voice_id': row['voice_id'], 'context': 'all', 'completion_evidence': 'provider_destination_callback'})
+                    self.finish(handoff, 'succeeded', row['call_id'], detail)
             voice = event.new_assistant_voice or {}
             if event.type == 'assistant.started' and voice.get('provider') == '11labs' and voice.get('voice_id') == row['voice_id']:
-                self.telemetry(ident, handoff_completed_at=now(), handoff_evidence_source=source)
+                confirmed_route()
+                self.telemetry(ident, handoff_completed_at=now(), handoff_evidence_source='provider_destination_callback')
             if (event.type == 'assistant.speechStarted' or (event.type == 'speech-update' and event.role == 'assistant' and event.status == 'started')):
                 telemetry = json.loads(self.current(ident)['telemetry'])
                 active_voice = event.active_assistant_voice or {}
                 expected_voice = active_voice.get('provider') == '11labs' and active_voice.get('voice_id') == row['voice_id']
                 if expected_voice and not telemetry.get('cloned_voice_first_audio_at'):
+                    confirmed_route()
                     if not telemetry.get('handoff_completed_at'):
-                        self.telemetry(ident, handoff_completed_at=now(), handoff_evidence_source=source)
-                    self.telemetry(ident, cloned_voice_first_audio_at=now(), cloned_voice_first_audio_source=source)
+                        self.telemetry(ident, handoff_completed_at=now(), handoff_evidence_source='provider_destination_callback')
+                    self.telemetry(ident, cloned_voice_first_audio_at=now(), cloned_voice_first_audio_source='provider_destination_callback',
+                                   cloned_voice_identity_evidence='destination_callback_credential',
+                                   cloned_voice_audio_evidence='provider_speech_event_not_acoustic_verification')
                     self.store.execute("UPDATE becoming_sessions SET state='CLONED_ACTIVE',failure=NULL,updated=? WHERE id=? AND revoked_at IS NULL AND ended_at IS NULL", (now(), ident))
         if source == 'client_reported' and event.type == 'assistant.speechStarted':
             self.telemetry(ident, client_cloned_voice_audio_observed_at=now())
@@ -814,7 +868,7 @@ def install(app, *, public_origin=None):
                             return
                         payload = json.loads(saved['payload'])
                         # Rebuild primitives rather than forwarding a provider or stored arbitrary dictionary.
-                        safe = {key: payload[key] for key in ('type', 'role', 'status', 'transcript_type', 'event_at_ms', 'event_time_source')
+                        safe = {key: payload[key] for key in ('type', 'role', 'status', 'transcript_type', 'event_at_ms', 'event_time_source', 'callback_route', 'identity_evidence', 'call_identity_evidence')
                                 if isinstance(payload.get(key), (str, int))}
                         if isinstance(payload.get('transcript'), str):
                             safe['transcript'] = payload['transcript'][:3000]
@@ -837,14 +891,25 @@ def install(app, *, public_origin=None):
                                  background=BackgroundTask(release))
 
     @app.post('/api/becoming/provider/{ident}')
+    @app.post('/api/becoming/provider/{ident}/cloned')
     async def provider_event(ident: str, request: Request):
         service.gate()
         row = service.store.one('SELECT * FROM becoming_sessions WHERE id=?', (ident,))
         secret = request.headers.get('x-raneen-becoming-event', '')
-        if not row or not secret or not secrets.compare_digest(row['webhook_hash'], token_hash(secret)):
+        callback_route = 'cloned_destination' if request.url.path.endswith('/cloned') else 'bootstrap'
+        expected_hash = row.get('destination_webhook_hash') if row and callback_route == 'cloned_destination' else row.get('webhook_hash') if row else None
+        if not expected_hash or not secret or not secrets.compare_digest(expected_hash, token_hash(secret)):
             raise HTTPException(401, 'Invalid provider event capability.')
         if row['revoked_at'] or row['ended_at']:
             return {'accepted': False, 'reason': 'conversation_ended'}
+        if not row['call_id']:
+            return {'accepted': False, 'reason': 'call_not_established'}
+        if callback_route == 'cloned_destination':
+            handoff = service.store.one("SELECT state FROM becoming_operations WHERE session_id=? AND kind='handoff' AND op_key=?", (ident, row['voice_id']))
+            telemetry = json.loads(row['telemetry'])
+            if (not row['voice_ready'] or not handoff or handoff['state'] not in ('dispatching', 'succeeded', 'outcome_unknown')
+                    or not telemetry.get('handoff_dispatch_started_at')):
+                raise HTTPException(409, 'The destination callback has no active cloned-voice handoff.')
         try:
             data = await request.json()
         except ValueError:
@@ -852,36 +917,72 @@ def install(app, *, public_origin=None):
         message = data.get('message', data) if isinstance(data, dict) else {}
         if not isinstance(message, dict):
             raise HTTPException(400, 'Invalid provider event object.')
-        call_data = message.get('call') or {}
-        call_id = call_data.get('id') if isinstance(call_data, dict) else None
-        if call_id != row['call_id']:
+        # Reading a streamed provider body yields control; withdrawal may have happened meanwhile.
+        row = service.current(ident, active=False)
+        if row['revoked_at'] or row['ended_at']:
+            return {'accepted': False, 'reason': 'conversation_ended'}
+        call_data = message.get('call')
+        if call_data is not None and not isinstance(call_data, dict):
+            raise HTTPException(400, 'Invalid provider call metadata.')
+        supplied_call = isinstance(call_data, dict) and 'id' in call_data
+        call_id = call_data['id'] if supplied_call else row['call_id']
+        if supplied_call and call_id != row['call_id']:
             raise HTTPException(409, 'Provider event does not match the active call.')
         kind = message.get('type')
         if kind == 'status-update' and message.get('status') == 'ended':
-            switching = row['state'] in ('SWITCHING_VOICE', 'HANDOFF_UNKNOWN')
-            failure = compact({'stage': 'handoff', 'reason': 'The provider call ended before cloned speech was confirmed.', 'uncertain': False, 'bootstrap_continues': False}) if switching else row['failure']
-            service.store.execute("UPDATE becoming_sessions SET call_state='closed',ended_at=COALESCE(ended_at,?),state=?,failure=?,updated=? WHERE id=?", (now(), 'HANDOFF_FAILED' if switching else 'ENDED', failure, now(), ident))
+            with service.store.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current = db.execute('SELECT * FROM becoming_sessions WHERE id=?', (ident,)).fetchone()
+                if current['revoked_at'] or current['ended_at']:
+                    return {'accepted': False, 'reason': 'conversation_ended'}
+                switching = current['state'] in ('SWITCHING_VOICE', 'HANDOFF_UNKNOWN')
+                failure = compact({'stage': 'handoff', 'reason': 'The provider call ended before cloned speech was confirmed.', 'uncertain': False, 'bootstrap_continues': False}) if switching else current['failure']
+                db.execute("UPDATE becoming_sessions SET call_state='closed',ended_at=COALESCE(ended_at,?),state=?,failure=?,updated=? WHERE id=?", (now(), 'HANDOFF_FAILED' if switching else 'ENDED', failure, now(), ident))
             return {'accepted': True, 'source': 'provider_authenticated'}
         if kind not in ('speech-update', 'transcript', 'assistant.started', 'assistant.speechStarted'):
             return {'accepted': False, 'reason': 'unused_event'}
         if kind == 'transcript' and message.get('transcriptType') != 'final':
             return {'accepted': False, 'reason': 'partial_transcript'}
         new_assistant = message.get('newAssistant') or {}
-        voice = new_assistant.get('voice') if kind == 'assistant.started' and isinstance(new_assistant, dict) else None
+        if not isinstance(new_assistant, dict):
+            raise HTTPException(400, 'Invalid destination assistant metadata.')
+        reported_new_voice = new_assistant.get('voice')
+        voice = reported_new_voice if kind == 'assistant.started' else None
         assistant = message.get('assistant') or {}
+        if not isinstance(assistant, dict):
+            raise HTTPException(400, 'Invalid active assistant metadata.')
         active_voice = assistant.get('voice') if isinstance(assistant, dict) else None
+        if callback_route == 'cloned_destination':
+            for owner in (new_assistant, assistant):
+                if 'voice' in owner and not isinstance(owner['voice'], dict):
+                    raise HTTPException(400, 'Invalid destination voice metadata.')
+            for reported in (reported_new_voice, active_voice):
+                if reported is not None and not isinstance(reported, dict):
+                    raise HTTPException(400, 'Invalid destination voice metadata.')
+                if isinstance(reported, dict):
+                    if ('provider' in reported and reported['provider'] != '11labs') or ('voiceId' in reported and reported['voiceId'] != row['voice_id']):
+                        raise HTTPException(409, 'The supplied voice conflicts with the scoped cloned destination.')
+            # Minimal provider speech events may omit assistant/call fields. Only this
+            # destination-specific credential can supply missing route identity; call.assistant
+            # is deliberately ignored because it can remain the original bootstrap config.
+            active_voice = {'provider': '11labs', 'voiceId': row['voice_id']}
+            if kind == 'assistant.started':
+                voice = active_voice
         receipt_ms = round(time.time() * 1000)
         timestamp = message.get('timestamp')
         event_ms = round(timestamp) if isinstance(timestamp, (int, float)) and 946684800000 <= timestamp <= receipt_ms + 5000 else receipt_ms
         identity = hashlib.sha256(compact(message).encode()).hexdigest() if timestamp is not None or message.get('turn') is not None else uid()
         try:
-            event = Event(event_id='provider:' + identity, call_id=call_id,
+            event = Event(event_id='provider:' + callback_route + ':' + identity, call_id=call_id,
                           type=kind, role=message.get('role'), status=message.get('status'),
                           transcript=message.get('transcript') if kind == 'transcript' else None,
                           transcript_type='final' if kind == 'transcript' else None,
                           new_assistant_voice={'provider': voice.get('provider'), 'voice_id': voice.get('voiceId')} if isinstance(voice, dict) else None,
                           active_assistant_voice={'provider': active_voice.get('provider'), 'voice_id': active_voice.get('voiceId')} if isinstance(active_voice, dict) else None,
-                          event_at_ms=event_ms, event_time_source='provider_timestamp' if event_ms != receipt_ms else 'server_receipt')
+                          event_at_ms=event_ms, event_time_source='provider_timestamp' if event_ms != receipt_ms else 'server_receipt',
+                          callback_route=callback_route,
+                          identity_evidence='destination_callback_credential' if callback_route == 'cloned_destination' else None,
+                          call_identity_evidence='supplied_call_id' if supplied_call else 'scoped_callback_credential')
         except ValueError:
             raise HTTPException(400, 'Invalid provider event fields.') from None
         return await service.event(ident, event, 'provider_authenticated')

@@ -13,6 +13,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 from studio.becoming import apply_migration
@@ -142,6 +143,20 @@ def wait_for(client, ident, headers, states):
     pytest.fail('No expected terminal processing state: ' + repr(data))
 
 
+def grant_callback(app, ident, destination=False):
+    token = ('synthetic-destination-' if destination else 'synthetic-bootstrap-') + ident
+    column = 'destination_webhook_hash' if destination else 'webhook_hash'
+    app.state.store.execute(f'UPDATE becoming_sessions SET {column}=? WHERE id=?', (hashlib.sha256(token.encode()).hexdigest(), ident))
+    return {'X-Raneen-Becoming-Event': token}
+
+
+def prepared(setup):
+    app, client, fake = setup
+    ident, headers = start(client); call(client, ident, headers); collect(client, ident, headers)
+    wait_for(client, ident, headers, {'SWITCHING_VOICE'})
+    return app, client, fake, ident, headers, grant_callback(app, ident), grant_callback(app, ident, True)
+
+
 def test_default_disabled_even_with_legacy_enrollment(tmp_path, monkeypatch):
     monkeypatch.delenv('RANEEN_BECOMING_ENABLED', raising=False)
     monkeypatch.setenv('RANEEN_VOICE_ENROLLMENT_ENABLED', '1')
@@ -207,8 +222,9 @@ def test_clone_synth_same_call_then_authoritative_audio_confirmation(setup):
     assert client.post(f'/api/becoming/sessions/{ident}/events', json=client_event, headers=headers).status_code == 200
     assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'SWITCHING_VOICE'
     row = app.state.store.one('SELECT bootstrap_config FROM becoming_sessions WHERE id=?', (ident,))
-    # Local mode deliberately does not configure public callbacks; test verified source through service.
+    # Local fixtures grant scoped callback credentials; hosted config wiring is tested separately.
     app.state.store.execute('UPDATE becoming_sessions SET webhook_hash=? WHERE id=?', (hashlib.sha256(b'provider-only-token').hexdigest(), ident))
+    app.state.store.execute('UPDATE becoming_sessions SET destination_webhook_hash=? WHERE id=?', (hashlib.sha256(b'destination-only-token').hexdigest(), ident))
     webhook_headers = {'X-Raneen-Becoming-Event': 'provider-only-token'}
     message = {'type': 'speech-update', 'role': 'assistant', 'status': 'started', 'call': {'id': CALL_ID},
                'assistant': {'voice': {'provider': '11labs', 'voiceId': 'bootstrap_voice'}}}
@@ -216,9 +232,12 @@ def test_clone_synth_same_call_then_authoritative_audio_confirmation(setup):
     assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'SWITCHING_VOICE'
     message['assistant']['voice']['voiceId'] = VOICE_ID
     assert client.post(f'/api/becoming/provider/{ident}', json={'message': message}, headers=webhook_headers).status_code == 200
+    assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'SWITCHING_VOICE'
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json={'message': message}, headers={'X-Raneen-Becoming-Event': 'destination-only-token'}).status_code == 200
     active = client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()
     assert active['state'] == 'CLONED_ACTIVE'
-    assert active['telemetry']['cloned_voice_first_audio_source'] == 'provider_authenticated'
+    assert active['telemetry']['cloned_voice_first_audio_source'] == 'provider_destination_callback'
+    assert active['telemetry']['cloned_voice_audio_evidence'] == 'provider_speech_event_not_acoustic_verification'
     assert client.get(f'/api/becoming/sessions/{ident}/voice-check', headers=headers).status_code == 200
     for _ in range(3):
         assert client.post(f'/api/becoming/sessions/{ident}/process', json={}, headers=headers).status_code == 200
@@ -413,13 +432,183 @@ def test_webhook_wrong_capability_and_call_and_malformed(setup):
     assert client.post(f'/api/becoming/provider/{ident}', json={'message': {'call': {'id': CALL_ID}, 'type': 'speech-update', 'role': 'invalid', 'status': 'started'}}, headers=hook).status_code == 400
 
 
+def test_source_minimal_events_bind_only_a_known_call(setup):
+    app, client, fake = setup
+    ident, headers = start(client); source = grant_callback(app, ident)
+    event = {'message': {'type': 'speech-update', 'role': 'user', 'status': 'started', 'turn': 1}}
+    early = client.post(f'/api/becoming/provider/{ident}', json=event, headers=source)
+    assert early.status_code == 200 and early.json() == {'accepted': False, 'reason': 'call_not_established'}
+    assert not app.state.store.all('SELECT * FROM becoming_events WHERE session_id=?', (ident,))
+    call(client, ident, headers)
+    source = grant_callback(app, ident)
+    response = client.post(f'/api/becoming/provider/{ident}', json=event, headers=source)
+    assert response.status_code == 200
+    saved = json.loads(app.state.store.one('SELECT payload FROM becoming_events WHERE session_id=?', (ident,))['payload'])
+    assert saved['call_id'] == CALL_ID and saved['callback_route'] == 'bootstrap'
+    assert saved['call_identity_evidence'] == 'scoped_callback_credential'
+    assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'CONVERSING_BOOTSTRAP'
+
+
+def test_minimal_destination_speech_scope_retry_and_late_source(setup):
+    app, client, fake, ident, headers, source, destination = prepared(setup)
+    message = {'type': 'speech-update', 'role': 'assistant', 'status': 'started', 'turn': 3}
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json={'message': message}, headers=source).status_code == 401
+    assert client.post(f'/api/becoming/provider/{ident}', json={'message': message}, headers=destination).status_code == 401
+    assert client.post(f'/api/becoming/provider/{ident}', json={'message': message}, headers=source).status_code == 200
+    assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'SWITCHING_VOICE'
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json={'message': message}, headers=destination).status_code == 200
+    active = client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()
+    assert active['state'] == 'CLONED_ACTIVE' and active['telemetry']['cloned_voice_identity_evidence'] == 'destination_callback_credential'
+    first_audio = active['telemetry']['cloned_voice_first_audio_at']
+    time.sleep(.01)
+    repeated = client.post(f'/api/becoming/provider/{ident}/cloned', json={'message': message}, headers=destination)
+    assert repeated.status_code == 200 and repeated.json()['duplicate'] is True
+    events = app.state.store.all('SELECT event_id,payload FROM becoming_events WHERE session_id=?', (ident,))
+    assert len(events) == 2 and len({row['event_id'] for row in events}) == 2
+    late = message | {'turn': 4, 'assistant': {'voice': {'provider': '11labs', 'voiceId': VOICE_ID}}}
+    assert client.post(f'/api/becoming/provider/{ident}', json={'message': late}, headers=source).status_code == 200
+    assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['telemetry']['cloned_voice_first_audio_at'] == first_audio
+
+
+@pytest.mark.parametrize('extra,status', [
+    ({'call': {'id': 'conflicting-call'}}, 409),
+    ({'call': {'id': None}}, 409),
+    ({'call': 'malformed'}, 400),
+    ({'assistant': {'voice': {'provider': '11labs', 'voiceId': 'bootstrap_voice'}}}, 409),
+    ({'assistant': {'voice': {'provider': 'vapi', 'voiceId': VOICE_ID}}}, 409),
+    ({'newAssistant': {'voice': {'provider': '11labs', 'voiceId': 'another_voice'}}}, 409),
+    ({'assistant': {'voice': 'malformed'}}, 400),
+])
+def test_destination_rejects_conflicting_supplied_identity(setup, extra, status):
+    app, client, fake, ident, headers, source, destination = prepared(setup)
+    message = {'type': 'speech-update', 'role': 'assistant', 'status': 'started', 'turn': 7} | extra
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json={'message': message}, headers=destination).status_code == status
+    assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'SWITCHING_VOICE'
+
+
+def test_destination_ignores_initial_call_assistant_and_accepts_optional_metadata(setup):
+    app, client, fake, ident, headers, source, destination = prepared(setup)
+    message = {'type': 'assistant.speechStarted', 'text': 'Synthetic reply.', 'turn': 2,
+               'call': {'id': CALL_ID, 'assistant': {'voice': {'provider': '11labs', 'voiceId': 'bootstrap_voice'}}}}
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json={'message': message}, headers=destination).status_code == 200
+    assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'CLONED_ACTIVE'
+
+
+def test_destination_requires_committed_handoff_and_known_ready_voice(setup):
+    app, client, fake = setup
+    ident, headers = start(client); call(client, ident, headers)
+    destination = grant_callback(app, ident, True)
+    message = {'message': {'type': 'speech-update', 'role': 'assistant', 'status': 'started'}}
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json=message, headers=destination).status_code == 409
+    app.state.store.execute('UPDATE becoming_sessions SET voice_ready=1,voice_id=? WHERE id=?', (VOICE_ID, ident))
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json=message, headers=destination).status_code == 409
+    assert not app.state.store.all('SELECT * FROM becoming_events WHERE session_id=?', (ident,))
+
+
+def test_unknown_handoff_restart_accepts_destination_without_repeating_create(setup):
+    from studio.becoming import BecomingService
+    app, client, fake, ident, headers, source, destination = prepared(setup)
+    app.state.store.execute("UPDATE becoming_operations SET state='outcome_unknown' WHERE session_id=? AND kind='handoff'", (ident,))
+    app.state.store.execute("UPDATE becoming_sessions SET state='HANDOFF_UNKNOWN' WHERE id=?", (ident,))
+    recovered = BecomingService(app)
+    event = {'message': {'type': 'speech-update', 'role': 'assistant', 'status': 'started', 'turn': 1}}
+    assert client.post(f'/api/becoming/provider/{ident}', json=event, headers=source).status_code == 200
+    assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'HANDOFF_UNKNOWN'
+    assert client.post(f'/api/becoming/provider/{ident}/cloned', json=event, headers=destination).status_code == 200
+    client.portal.call(recovered.process, ident)
+    assert fake.clone_count == 1 and fake.synth_count == 1 and len(fake.controls) == 1
+    assert app.state.store.one("SELECT state FROM becoming_operations WHERE session_id=? AND kind='handoff'", (ident,))['state'] == 'succeeded'
+
+
+@pytest.mark.parametrize('ending', ['end', 'revoke'])
+def test_late_destination_event_after_end_or_revoke_is_ignored(setup, ending):
+    app, client, fake, ident, headers, source, destination = prepared(setup)
+    body = {'confirm': True} if ending == 'revoke' else {}
+    assert client.post(f'/api/becoming/sessions/{ident}/{ending}', json=body, headers=headers).status_code == 200
+    message = {'message': {'type': 'speech-update', 'role': 'assistant', 'status': 'started'}}
+    response = client.post(f'/api/becoming/provider/{ident}/cloned', json=message, headers=destination)
+    assert response.status_code == 200 and response.json()['accepted'] is False
+    assert 'cloned_voice_first_audio_at' not in client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['telemetry']
+
+
+def test_callback_body_read_racing_revoke_preserves_terminal_state(setup):
+    from starlette.requests import Request
+    app, client, fake = setup
+    ident, headers = start(client); call(client, ident, headers)
+    source = grant_callback(app, ident)
+    request = Request({'type': 'http', 'method': 'POST', 'scheme': 'http', 'path': f'/api/becoming/provider/{ident}',
+                       'query_string': b'', 'headers': [(b'x-raneen-becoming-event', source['X-Raneen-Becoming-Event'].encode()), (b'host', b'testserver')],
+                       'server': ('testserver', 80), 'client': ('testclient', 100), 'app': app})
+    async def revoked_body():
+        app.state.store.execute("UPDATE becoming_sessions SET state='REVOKED',revoked_at=created,ended_at=created WHERE id=?", (ident,))
+        await app.state.becoming.cleanup(ident)
+        return {'message': {'type': 'status-update', 'status': 'ended'}}
+    request.json = revoked_body
+    endpoint = next(route.endpoint for route in app.routes if getattr(route, 'path', '') == '/api/becoming/provider/{ident}')
+    response = client.portal.call(endpoint, ident, request)
+    assert response == {'accepted': False, 'reason': 'conversation_ended'}
+    assert app.state.store.one('SELECT state FROM becoming_sessions WHERE id=?', (ident,))['state'] == 'REVOKED'
+
+
+@pytest.mark.parametrize('first_event', ['speech-update', 'assistant.started'])
+def test_hosted_destination_callback_before_control_timeout_preserves_confirmation(tmp_path, monkeypatch, first_event):
+    for name, value in {'RANEEN_BECOMING_ENABLED': '1', 'VAPI_API_KEY': 'mock-vapi-private',
+                        'ELEVENLABS_API_KEY': 'mock-eleven-private',
+                        'RANEEN_VAPI_TEMPLATE_ID': 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'}.items():
+        monkeypatch.setenv(name, value)
+    origin = 'https://synthetic.example'
+    app = create_app(tmp_path, public_origin=origin, owner_only=True)
+    fake = Fake(); app.state.becoming_provider = fake
+    callback = {}
+    async def fast_control(url, body):
+        fake.controls.append(body)
+        if body['type'] != 'handoff':
+            return
+        destination = body['destination']['assistant']
+        server = destination['server']
+        callback.update(server)
+        message = {'type': first_event, 'turn': 1}
+        if first_event == 'speech-update':
+            message.update({'role': 'assistant', 'status': 'started'})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as bridge:
+            response = await bridge.post(server['url'], headers=server['headers'], json={'message': message})
+            assert response.status_code == 200, response.text
+        raise ProviderError('Synthetic control acknowledgement timed out.', uncertain=True)
+    fake.vapi_control = fast_control
+    with TestClient(app, base_url=origin, headers={'Origin': origin}) as client:
+        ident, headers = start(client); call(client, ident, headers)
+        source = fake.calls[-1][2]['assistant']['server']
+        collect(client, ident, headers)
+        for _ in range(100):
+            data = client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()
+            if data['telemetry'].get('handoff_control_acknowledgement_error'):
+                break
+            time.sleep(.02)
+        assert data['telemetry']['handoff_evidence_source'] == 'provider_destination_callback'
+        assert data['state'] == ('CLONED_ACTIVE' if first_event == 'speech-update' else 'SWITCHING_VOICE')
+        operation = app.state.store.one("SELECT state,detail FROM becoming_operations WHERE session_id=? AND kind='handoff'", (ident,))
+        assert operation['state'] == 'succeeded'
+        assert json.loads(operation['detail'])['completion_evidence'] == 'provider_destination_callback'
+        assert source['url'] + '/cloned' == callback['url']
+        assert source['headers']['X-Raneen-Becoming-Event'] != callback['headers']['X-Raneen-Becoming-Event']
+        for secret in (source['headers']['X-Raneen-Becoming-Event'], callback['headers']['X-Raneen-Becoming-Event']):
+            assert secret not in json.dumps(data)
+        if first_event == 'assistant.started':
+            response = client.post(callback['url'], headers=callback['headers'], json={'message': {'type': 'assistant.speechStarted', 'text': 'Synthetic next reply.', 'turn': 2}})
+            assert response.status_code == 200
+            assert client.get(f'/api/becoming/sessions/{ident}', headers=headers).json()['state'] == 'CLONED_ACTIVE'
+        assert fake.clone_count == 1 and fake.synth_count == 1
+
+
 def test_sse_relays_only_scoped_normalized_provider_evidence(setup):
     from starlette.requests import Request
     app, client, fake = setup
     ident, headers = start(client); call(client, ident, headers)
     private = {'type': 'speech-update', 'role': 'user', 'status': 'started', 'api_key': 'DO-NOT-RELAY',
                'assistant': {'server': {'headers': {'secret': 'DO-NOT-RELAY'}}},
-               'active_assistant_voice': {'provider': '11labs', 'voice_id': VOICE_ID, 'secret': 'DO-NOT-RELAY'}}
+               'active_assistant_voice': {'provider': '11labs', 'voice_id': VOICE_ID, 'secret': 'DO-NOT-RELAY'},
+               'callback_route': 'cloned_destination', 'identity_evidence': 'destination_callback_credential',
+               'call_identity_evidence': 'scoped_callback_credential'}
     stamp = app.state.store.one('SELECT created FROM becoming_sessions WHERE id=?', (ident,))['created']
     for event_id, source in [('trusted', 'provider_authenticated'), ('untrusted', 'client_reported')]:
         app.state.store.execute('INSERT INTO becoming_events VALUES(?,?,?,?,?,?)', (ident, event_id, source, 'speech-update', json.dumps(private), stamp))
@@ -440,6 +629,7 @@ def test_sse_relays_only_scoped_normalized_provider_evidence(setup):
     assert result.count('event: provider_event') == 1
     assert 'DO-NOT-RELAY' not in result and 'api_key' not in result and 'assistant' not in result.replace('active_assistant_voice', '')
     assert 'received_at_ms' in result and 'relay_at_ms' in result
+    assert 'destination_callback_credential' in result and 'cloned_destination' in result
     assert not app.state.becoming.stream_counts
 
 
@@ -500,7 +690,7 @@ def test_additive_migration_preserves_old_users(setup):
     apply_migration(app.state.store)
     assert app.state.store.one('SELECT name FROM users WHERE id=?', (original['id'],))['name'] == 'Synthetic Owner'
     assert app.state.store.one('SELECT version FROM becoming_schema_versions')['version'] == 10
-    assert app.state.store.one('SELECT MAX(version) AS v FROM becoming_schema_versions')['v'] == 11
+    assert app.state.store.one('SELECT MAX(version) AS v FROM becoming_schema_versions')['v'] == 12
 
 
 def test_expired_retention_blocks_personal_artifacts_but_allows_revoke(setup):
