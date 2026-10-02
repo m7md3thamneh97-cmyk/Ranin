@@ -119,13 +119,18 @@ def sanitized_assistant(source: dict, session_id: str, *, webhook_url: str | Non
     return config
 
 
-def cloned_assistant(base: dict, voice_id: str, profile: dict) -> dict:
+def cloned_assistant(base: dict, voice_id: str, profile: dict, *,
+                     webhook_url: str | None = None, webhook_secret: str | None = None) -> dict:
     config = copy.deepcopy(base)
     config['voice'] = {'provider': '11labs', 'voiceId': voice_id,
                        'model': os.environ.get('RANEEN_VAPI_VOICE_MODEL', 'eleven_multilingual_v2'),
                        'stability': .45, 'similarityBoost': .8, 'useSpeakerBoost': True}
     config['firstMessage'] = ''
     config['firstMessageMode'] = 'assistant-speaks-first-with-model-generated-message'
+    if webhook_url and webhook_secret:
+        # The destination has its own callback path and credential. Old source events
+        # can never establish that speech came from this newly configured destination.
+        config['server'] = {'url': webhook_url, 'headers': {'X-Raneen-Becoming-Event': webhook_secret}}
     config['model']['messages'].append({'role': 'system', 'content':
         'Continue the same conversation without another greeting. You now use the licensed synthetic voice. '
         'Mirror observed wording cautiously; retain all prior context and corrections. '

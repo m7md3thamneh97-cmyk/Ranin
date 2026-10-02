@@ -231,7 +231,7 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
                 return Response('Not found.', status_code=404)
             # Validate before FastAPI reads an API request body. Never put credentials in URLs.
             becoming_path = bool(re.fullmatch(
-                r'/api/becoming/(?:readiness|sessions(?:/[0-9a-f]{32}(?:/(?:call|process|events|events-stream|end|revoke|voice-check|preflight|chunks/[0-9]{1,5}))?)?|provider/[0-9a-f]{32})',
+                r'/api/becoming/(?:readiness|sessions(?:/[0-9a-f]{32}(?:/(?:call|process|events|events-stream|end|revoke|voice-check|preflight|chunks/[0-9]{1,5}))?)?|provider/[0-9a-f]{32}(?:/cloned)?)',
                 request.url.path,
             ))
             if request.url.path.startswith('/api/') and not becoming_path:
