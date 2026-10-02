@@ -14,8 +14,6 @@ jobs:
   synthetic-regression:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-synthetic-ui
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,8 +36,12 @@ jobs:
           for test in tests/*.mjs; do node "$test"; done
           for module in studio/static/become*.js; do node --check "$module"; done
       - name: Single conversation browser regression (synthetic)
+        env:
+          RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-synthetic-ui
         run: python tests/becoming_dom.py
       - name: Existing enrollment browser regression (synthetic)
+        env:
+          RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-synthetic-ui
         run: python tests/enrollment_dom.py
       - name: Existing guided DOM regression (synthetic)
         run: |
