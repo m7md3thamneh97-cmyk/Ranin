@@ -4,7 +4,7 @@ Run after installing requirements-browser.txt and Playwright Chromium:
     python tests/becoming_dom.py
 
 HTML, CSS, modules, the PCM worklet and response security headers are served by
-the real FastAPI app. Becoming API responses, the event relay and Daily SDK are explicit
+the real FastAPI app over trusted loopback HTTP. Becoming API responses, the event relay and Daily SDK are explicit
 synthetic fixtures; getUserMedia returns an oscillator, never a physical mic.
 This does not establish live provider, real microphone or voice-quality proof.
 No API keys, real speech, provider calls or external HTTP requests are allowed.
@@ -14,20 +14,24 @@ Set CHROMIUM_EXECUTABLE only for an already installed Chromium binary.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import socket
 import tempfile
+import threading
+import time
 from urllib.parse import urlsplit
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi.testclient import TestClient
 from playwright.sync_api import expect, sync_playwright
+import uvicorn
 
 from studio.runtime import create_app
 
@@ -164,11 +168,35 @@ def synthetic_preview() -> bytes:
     return result.stdout
 
 
+@contextmanager
+def loopback_server(app, listener):
+    """Allow Chromium itself to fetch the actual PCM worklet and static assets.
+
+    Worklet module fetches do not consistently surface in Playwright page
+    interception. A real localhost origin also has trusted-context microphone
+    APIs, without a fictitious DNS host, TLS certificate or altered app CSP.
+    """
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
+    thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    try:
+        while not server.started:
+            if not thread.is_alive() or time.monotonic() >= deadline:
+                raise RuntimeError("Synthetic loopback app could not start")
+            time.sleep(.02)
+        yield
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        if thread.is_alive():
+            raise RuntimeError("Synthetic loopback app did not stop")
+
+
 class SyntheticBecoming:
     """Browser contract fixture, independent of the separately tested service."""
 
-    def __init__(self, client, *, configured=True):
-        self.client = client
+    def __init__(self, *, configured=True):
         self.configured = configured
         self.state = "COLLECTING_VOICE"
         self.voice_ready = False
@@ -229,7 +257,7 @@ class SyntheticBecoming:
             self.created += 1
             assert self.created == 1, "A single-conversation flow must not create another enrollment"
             self.fulfill_json(route, {"id": SESSION_ID, "capability": CAPABILITY, "state": "IDLE"}, status=201,
-                headers={"Set-Cookie": f"raneen_becoming={CAPABILITY}; Path=/api/becoming/sessions/{SESSION_ID}; Max-Age=604800; Secure; HttpOnly; SameSite=Strict"})
+                headers={"Set-Cookie": f"raneen_becoming={CAPABILITY}; Path=/api/becoming/sessions/{SESSION_ID}; Max-Age=604800; HttpOnly; SameSite=Strict"})
             return
         prefix = "/api/becoming/sessions/" + SESSION_ID
         if path == prefix or path.startswith(prefix + "/"):
@@ -277,12 +305,8 @@ class SyntheticBecoming:
             else:
                 raise AssertionError("Unexpected becoming request: " + request.method + " " + suffix)
             return
-        response = self.client.request(request.method, path + ("?" + parsed.query if parsed.query else ""),
-            headers=request.headers, content=request.post_data_buffer)
-        headers = {key: value for key, value in response.headers.items() if key.lower() not in {"content-length", "content-encoding", "transfer-encoding"}}
-        if path == "/":
-            self.headers = headers
-        route.fulfill(status=response.status_code, headers=headers, body=response.content)
+        assert request.method == "GET" and (path in {"/", "/favicon.ico"} or path.startswith("/static/")), "Unexpected non-fixture request"
+        route.continue_()
 
 
 def no_overflow(page):
@@ -301,8 +325,8 @@ def start(page, fixture):
         expect(page.locator("#experience")).to_have_attribute("data-state", "COLLECTING_VOICE")
     except AssertionError:
         try:
-            debug = json.loads(page.locator("#debug").inner_text())
-            debug_failure = {key: debug[key] for key in ("failure_stage", "failure_name", "last_failure_stage", "last_failure_name") if key in debug}
+            debug = json.loads(page.locator("#debug").text_content() or "{}")
+            debug_failure = {key: debug[key] for key in ("failure_stage", "failure_name", "last_failure_stage", "last_failure_name", "last_failure_code") if key in debug}
         except (ValueError, TypeError):
             debug_failure = {}
         print("Synthetic bootstrap diagnostics:", json.dumps({
@@ -325,15 +349,18 @@ def start(page, fixture):
 
 
 def main():
+    global ORIGIN
     for key in list(os.environ):
         if key.startswith(("OPENAI_", "ELEVENLABS_", "VAPI_", "RANEEN_")) and key != "RANEEN_UI_OUTPUT_DIR":
             os.environ.pop(key, None)
     os.environ["RANEEN_BECOMING_ENABLED"] = "1"
     output = Path(os.environ.get("RANEEN_UI_OUTPUT_DIR", "/tmp/raneen-becoming-ui"))
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="raneen-becoming-ui-") as data_dir:
-        app = create_app(data_dir, public_origin=ORIGIN, owner_only=True)
-        with TestClient(app, base_url=ORIGIN) as client, sync_playwright() as playwright:
+    with tempfile.TemporaryDirectory(prefix="raneen-becoming-ui-") as data_dir, socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        ORIGIN = "http://localhost:" + str(listener.getsockname()[1])
+        app = create_app(data_dir, owner_only=True)
+        with loopback_server(app, listener), sync_playwright() as playwright:
             options = {"headless": True, "args": ["--no-sandbox"]}
             if os.environ.get("CHROMIUM_EXECUTABLE"):
                 options["executable_path"] = os.environ["CHROMIUM_EXECUTABLE"]
@@ -345,7 +372,7 @@ def main():
                 context.add_init_script("window.__denyMicrophone = " + json.dumps(denied) + ";")
                 context.add_init_script(SYNTHETIC_MEDIA)
                 context.add_init_script(SYNTHETIC_RELAY)
-                fixture = SyntheticBecoming(client, configured=configured)
+                fixture = SyntheticBecoming(configured=configured)
                 fixtures.append(fixture)
                 page = context.new_page()
                 page.set_default_timeout(10000)
@@ -355,7 +382,8 @@ def main():
                 page.on("requestfailed", lambda request: fixture.failed_requests.append({"path": urlsplit(request.url).path, "reason": request.failure}))
                 page.on("dialog", lambda dialog: dialog.accept())
                 context.route("**/*", fixture.route)
-                page.goto(ORIGIN + "/", wait_until="networkidle")
+                response = page.goto(ORIGIN + "/", wait_until="networkidle")
+                fixture.headers = response.headers
                 expect(page.locator("#experience")).to_have_attribute("data-state", "IDLE")
                 assert "'unsafe-eval'" not in fixture.headers["content-security-policy"]
                 assert "'unsafe-inline'" not in fixture.headers["content-security-policy"]
