@@ -29,16 +29,16 @@ jobs:
           python -m playwright install chromium --with-deps
           sudo apt-get update
           sudo apt-get install --yes ffmpeg
+      - name: Single conversation browser regression (synthetic)
+        env:
+          RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-synthetic-ui
+        run: python tests/becoming_dom.py
       - name: Python regression suite
         run: python -m pytest -q
       - name: JavaScript regression suites and syntax
         run: |
           for test in tests/*.mjs; do node "$test"; done
           for module in studio/static/become*.js; do node --check "$module"; done
-      - name: Single conversation browser regression (synthetic)
-        env:
-          RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-synthetic-ui
-        run: python tests/becoming_dom.py
       - name: Existing enrollment browser regression (synthetic)
         env:
           RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-synthetic-ui

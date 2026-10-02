@@ -108,14 +108,14 @@ test('Daily rejects non-provider destinations and repeated call starts',async()=
   const call=new BecomingCall({Daily:fakeDaily().sdk});await call.start({url:'https://raneen.daily.co/room',microphoneTrack:{kind:'audio'}});await assert.rejects(call.start({url:'https://raneen.daily.co/room',microphoneTrack:{kind:'audio'}}),/call_already_started/);await call.stop();
 });
 
-function browserFixture({permissionDenied=false,configured=true,serverStates=['COLLECTING_VOICE'],savedSession=null,retentionDays=7}={}){
+function browserFixture({permissionDenied=false,configured=true,serverStates=['COLLECTING_VOICE'],savedSession=null,retentionDays=7,debug=false}={}){
   const elements=new Map(),requests=[],listeners=new Map(),daily=fakeDaily(),sources=[];let stopped=0,closed=0,gets=0;const currentId=savedSession??'b'.repeat(32);
   const element=id=>{if(!elements.has(id))elements.set(id,{id,dataset:{},textContent:'',hidden:false,checked:false,disabled:false,setAttribute(){},getAttribute(name){return this[name];},removeAttribute(name){delete this[name];},pause(){},querySelector(){return element(id+'Label');}});return elements.get(id);};
   const track={kind:'audio',stop:()=>stopped++,getSettings:()=>({sampleRate:48000,echoCancellation:true})};
   element('retention').dataset.copy='retention';
   globalThis.document={documentElement:{},getElementById:element,querySelectorAll:()=>[element('retention')],createElement:()=>({play:async()=>{},pause(){},remove(){}})};
   globalThis.window={confirm:()=>true,addEventListener:(name,fn)=>listeners.set(name,fn)};
-  globalThis.location={search:'',origin:'https://synthetic.example'};
+  globalThis.location={search:debug?'?debug=1':'',origin:'https://synthetic.example'};
   const storage=new Map(savedSession?[['raneen-becoming-session',savedSession]]:[]);globalThis.localStorage={setItem:(key,value)=>storage.set(key,value),getItem:key=>storage.get(key)??null,removeItem:key=>storage.delete(key)};
   if(!globalThis.crypto)Object.defineProperty(globalThis,'crypto',{configurable:true,value:webcrypto});globalThis.DailyIframe=daily.sdk;globalThis.MediaStream=class{constructor(tracks){this.tracks=tracks;}};
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>{if(permissionDenied){const error=new Error('denied');error.name='NotAllowedError';throw error;}return {getTracks:()=>[track],getAudioTracks:()=>[track]};}}}});
@@ -135,11 +135,11 @@ function browserFixture({permissionDenied=false,configured=true,serverStates=['C
   return {element,requests,daily,sources,listeners,storage,stopped:()=>stopped,closed:()=>closed,async load(){await import('../studio/static/become.js?test='+Math.random());await new Promise(resolve=>setTimeout(resolve,5));},async create(){element('consent').checked=true;element('consent').onchange();await element('create').onclick();},async cleanup(){listeners.get('pagehide')?.();await new Promise(resolve=>setTimeout(resolve,5));}};
 }
 
-test('microphone denial creates no paid call or anonymous session',async()=>{
-  const fixture=browserFixture({permissionDenied:true});await fixture.load();await fixture.create();
+test('microphone denial creates no paid call or anonymous session and debug errors are allowlisted',async()=>{
+  const fixture=browserFixture({permissionDenied:true,debug:true});await fixture.load();await fixture.create();
   assert.equal(fixture.element('experience').dataset.state,'FAILED');
   assert.ok(!fixture.requests.some(request=>request.url==='/api/becoming/sessions'||request.url.endsWith('/call')));
-  assert.equal(fixture.element('notice').hidden,false);await fixture.cleanup();
+  assert.equal(fixture.element('notice').hidden,false);const diagnostics=JSON.parse(fixture.element('debug').textContent);assert.equal(diagnostics.last_failure_stage,'microphone');assert.equal(diagnostics.last_failure_name,'NotAllowedError');assert.equal(diagnostics.last_failure_code,null);assert.ok(!fixture.element('debug').textContent.includes('denied'));await fixture.cleanup();
 });
 
 test('configured-provider map must be fully ready before create can run',async()=>{

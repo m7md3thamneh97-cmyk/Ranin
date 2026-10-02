@@ -9,8 +9,10 @@ const copy={
 };
 
 const $=id=>document.getElementById(id);
-let language='ar',state=States.IDLE,readiness=null,session=null,capture=null,call=null,events=null,relayHealthy=false,server=null,epoch=0,pollTimer=null,durationTimer=null,pollRunning=false,observedVoice=null,firstClonedSpeechReported=false,speaking=null,noticeKey=null;
+let language='ar',state=States.IDLE,readiness=null,session=null,capture=null,call=null,events=null,relayHealthy=false,server=null,epoch=0,pollTimer=null,durationTimer=null,pollRunning=false,observedVoice=null,firstClonedSpeechReported=false,speaking=null,noticeKey=null,lastFailureStage=null,lastFailureName=null,lastFailureCode=null;
 const debugMode=new URLSearchParams(location.search).get('debug')==='1';
+const safeErrorNames=new Set(['Error','TypeError','NotAllowedError','PermissionDeniedError','NotFoundError','NotReadableError','NotSupportedError','SecurityError','AbortError','InvalidStateError']);
+const safeFrontendFailureCodes=new Set(['recording_unsupported','sample_rate_unsupported','capture_already_started','invalid_call_room','call_unavailable','invalid_session','event_stream_already_started','request_failed']);
 const t=key=>copy[language][key]??key;
 copy.ar.savedVoice='استمع إلى عيّنة جديدة بصوتك';copy.en.savedVoice='Listen to a fresh sample with your voice';
 copy.ar.retention='يبقى صوتك وعيّنته متاحين في هذا المتصفّح لمدة {days} أيام، ثم يُجدول حذفهما تلقائياً. يمكنك طلب الحذف قبل ذلك.';
@@ -55,7 +57,7 @@ function render(){
   const saved=Math.floor(Number(server?.eligible_audio_seconds)||0);
   $('progress').textContent=saved>0?t('progress').replace('{seconds}',String(saved)):'';
   $('diagnostics').hidden=!debugMode;
-  if(debugMode)$('debug').textContent=JSON.stringify({state,server_state:server?.state??null,saved_speech_seconds:Number(server?.eligible_audio_seconds)||0,minimum_speech_seconds:server?.minimum_speech_seconds??readiness?.minimum_speech_seconds??null,capture_eligible_seconds:Math.round((capture?.durationSeconds||0)*100)/100,pending_chunks:capture?.queue.items.length||0,provider_relay_confirmed:relayHealthy,provider_observed_voice:observedVoice?{provider:observedVoice.provider,voice_id:observedVoice.voice_id}:null,telemetry:server?.telemetry??null,failure:server?.failure?.code??null},null,2);
+  if(debugMode)$('debug').textContent=JSON.stringify({state,server_state:server?.state??null,last_failure_stage:lastFailureStage,last_failure_name:lastFailureName,last_failure_code:lastFailureCode,saved_speech_seconds:Number(server?.eligible_audio_seconds)||0,minimum_speech_seconds:server?.minimum_speech_seconds??readiness?.minimum_speech_seconds??null,capture_eligible_seconds:Math.round((capture?.durationSeconds||0)*100)/100,pending_chunks:capture?.queue.items.length||0,provider_relay_confirmed:relayHealthy,provider_observed_voice:observedVoice?{provider:observedVoice.provider,voice_id:observedVoice.voice_id}:null,telemetry:server?.telemetry??null,failure:server?.failure?.code??null},null,2);
   if(noticeKey)notice(noticeKey);
 }
 function setState(value){if(Object.values(States).includes(value))state=value;render();}
@@ -102,6 +104,7 @@ async function create(){
   if(state!==States.IDLE&&state!==States.FAILED)return;
   if(!$('consent').checked||!readiness?.enabled||!isConfigured())return;
   const currentEpoch=++epoch;notice(null);speaking=null;observedVoice=null;firstClonedSpeechReported=false;server=null;setState(States.CONNECTING);
+  let stage='microphone';lastFailureStage=null;lastFailureName=null;lastFailureCode=null;
   try{
     // Request the microphone first so a denied permission cannot start a paid
     // call or leave a live room running in the background.
@@ -109,6 +112,7 @@ async function create(){
     capture.suspendGate();relayHealthy=false;
     await capture.start();
     if(epoch!==currentEpoch){await capture.stop({save:false});return;}
+    stage='session';
     const created=await api('/sessions',{method:'POST',body:{consent_version:'becoming-v1',own_voice:true,recording:true,external_processing:true,voice_cloning:true,private_preview:true,language}});
     session=created;
     rememberSession(created.id);
@@ -116,10 +120,12 @@ async function create(){
     capture.queue.sessionId=created.id;
     events=new BecomingEventStream({onEvent:(message,at)=>{if(epoch===currentEpoch)providerEvent(message,at);},onOpen:()=>{if(epoch!==currentEpoch)return;relayHealthy=true;if(!['CLONING','CLONE_CREATED','CLONE_READY','SWITCHING_VOICE','CLONED_ACTIVE'].includes(state))capture?.setCollecting(true);if(noticeKey==='eventPaused')notice(null);},onError:()=>{if(epoch!==currentEpoch)return;relayHealthy=false;capture?.suspendGate();speaking=null;if(!['CLONE_READY','SWITCHING_VOICE','CLONED_ACTIVE'].includes(state))notice('eventPaused');render();},onClosed:terminal=>{if(epoch!==currentEpoch)return;relayHealthy=false;capture?.suspendGate();if(terminal==='REVOKED')end({revoke:true,remote:true});else end({remote:true});}});
     events.start(created.id);
+    stage='call';
     const room=await api('/sessions/'+session.id+'/call',{method:'POST',body:{}});
     session.call_id=room.call_id;
     if(epoch!==currentEpoch){await api('/sessions/'+session.id+'/end',{method:'POST',body:{}});return;}
     call=new BecomingCall({onPlayback:active=>{if(epoch===currentEpoch)capture?.playback(active);},onConnected:()=>{if(epoch!==currentEpoch)return;setState(States.CONVERSING_BOOTSTRAP);poll();},onEnded:()=>end(),onError:()=>{notice('lost');end();},onSoundBlocked:blocked=>{$('sound').hidden=!blocked;}});
+    stage='join';
     await call.start({url:room.web_call_url,token:room.call_token,microphoneTrack:capture.stream.getAudioTracks()[0]});
     if(epoch!==currentEpoch)return;
     pollTimer=setInterval(poll,1500);
@@ -127,12 +133,13 @@ async function create(){
     render();
   }catch(error){
     if(epoch!==currentEpoch)return;
+    lastFailureStage=stage;lastFailureName=safeErrorNames.has(error.name)?error.name:'UnknownError';lastFailureCode=safeFrontendFailureCodes.has(error.message)?error.message:null;
     clearInterval(pollTimer);clearTimeout(durationTimer);
     events?.stop();relayHealthy=false;
     await capture?.stop({save:false});await call?.stop();
     if(session)await api('/sessions/'+session.id+'/end',{method:'POST',body:{}}).catch(()=>{});
     setState(States.FAILED);
-    notice(['NotAllowedError','PermissionDeniedError'].includes(error.name)?'permission':['NotFoundError','NotReadableError'].includes(error.name)||['recording_unsupported','sample_rate_unsupported'].includes(error.message)?'unsupported':'connectError');
+    notice(['NotAllowedError','PermissionDeniedError'].includes(error.name)?'permission':['NotFoundError','NotReadableError'].includes(error.name)||(stage==='microphone'&&error.name==='NotSupportedError')||['recording_unsupported','sample_rate_unsupported'].includes(error.message)?'unsupported':'connectError');
   }
 }
 async function end({revoke=false,remote=false}={}){

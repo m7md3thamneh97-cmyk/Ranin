@@ -44,7 +44,10 @@ SYNTHETIC_MEDIA = r"""
     state.requested++;
     if (window.__denyMicrophone) throw new DOMException('Synthetic permission denial', 'NotAllowedError');
     if (options.video !== false || options.audio.autoGainControl !== false) throw Error('Unexpected microphone configuration');
-    const context = new AudioContext();
+    // Chromium cannot bridge Web Audio-produced streams between different
+    // context sample rates. Physical microphone capture normally resamples;
+    // this oscillator fixture must match the actual 24 kHz capture context.
+    const context = new AudioContext({sampleRate: 24000});
     const oscillator = context.createOscillator();
     const gain = context.createGain();
     const destination = context.createMediaStreamDestination();
@@ -177,6 +180,8 @@ class SyntheticBecoming:
         self.events = []
         self.external_requests = []
         self.errors = []
+        self.console_errors = []
+        self.failed_requests = []
         self.headers = {}
         self.preview = synthetic_preview()
 
@@ -292,7 +297,24 @@ def start(page, fixture):
     page.locator("#consent").check()
     expect(page.locator("#create")).to_be_enabled()
     page.locator("#create").click()
-    expect(page.locator("#experience")).to_have_attribute("data-state", "COLLECTING_VOICE")
+    try:
+        expect(page.locator("#experience")).to_have_attribute("data-state", "COLLECTING_VOICE")
+    except AssertionError:
+        try:
+            debug = json.loads(page.locator("#debug").inner_text())
+            debug_failure = {key: debug[key] for key in ("failure_stage", "failure_name", "last_failure_stage", "last_failure_name") if key in debug}
+        except (ValueError, TypeError):
+            debug_failure = {}
+        print("Synthetic bootstrap diagnostics:", json.dumps({
+            "state": page.locator("#experience").get_attribute("data-state"),
+            "notice": page.locator("#notice").inner_text(),
+            "media": page.evaluate("window.__syntheticMedia"),
+            "sessions_created": fixture.created, "calls_created": fixture.calls,
+            "fixture_errors": fixture.errors, "browser_console_errors": fixture.console_errors,
+            "failed_request_paths": fixture.failed_requests,
+            "failure_stage_and_name": debug_failure,
+        }, ensure_ascii=False))
+        raise
     assert page.evaluate("window.__syntheticMedia.active") == 1
     assert page.evaluate("window.__syntheticDaily.created") == 1
     assert page.evaluate("window.__syntheticRelay.sources.length === 1 && window.__syntheticRelay.sources[0].readyState === 1")
@@ -329,8 +351,10 @@ def main():
                 page.set_default_timeout(10000)
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.on("console", lambda item: errors.append(item.text) if item.type == "error" and "Content Security Policy" in item.text else None)
+                page.on("console", lambda item: fixture.console_errors.append(item.text) if item.type == "error" else None)
+                page.on("requestfailed", lambda request: fixture.failed_requests.append({"path": urlsplit(request.url).path, "reason": request.failure}))
                 page.on("dialog", lambda dialog: dialog.accept())
-                page.route("**/*", fixture.route)
+                context.route("**/*", fixture.route)
                 page.goto(ORIGIN + "/", wait_until="networkidle")
                 expect(page.locator("#experience")).to_have_attribute("data-state", "IDLE")
                 assert "'unsafe-eval'" not in fixture.headers["content-security-policy"]
@@ -370,6 +394,10 @@ def main():
             no_overflow(page)
             assert page.locator("#create").evaluate("button => button.getBoundingClientRect().bottom <= innerHeight"), "English primary action is below the mobile fold"
             page.screenshot(path=str(output / "becoming-mobile-en.png"), full_page=True)
+            # Keep ordinary layout screenshots free of diagnostics, then expose
+            # only the safe failure stage/name for bootstrap failure reporting.
+            page.goto(ORIGIN + "/?debug=1", wait_until="networkidle")
+            page.locator("#language").click()
             start(page, fixture)
             # Actual PCM/worklet/WAV/upload code executes on an oscillator.
             # Provider configuration disables Daily app messages. Only the
