@@ -22,10 +22,15 @@ copy.en.eventPaused='Voice capture is paused until the connection is confirmed. 
 const storageKey='raneen-becoming-session';
 function rememberSession(id){try{if(id)localStorage.setItem(storageKey,id);else localStorage.removeItem(storageKey);}catch{}}
 function isConfigured(){return readiness?.configured===true||(readiness?.configured&&typeof readiness.configured==='object'&&Object.keys(readiness.configured).length>0&&Object.values(readiness.configured).every(value=>value===true));}
+function canRetryFailedStart(){
+  return !!session&&[States.FAILED,States.ENDED].includes(state)&&server?.call_state==='failed'
+    &&server?.failure?.stage==='call'&&Number(server?.eligible_audio_seconds)===0
+    &&!server?.voice_id&&server?.voice_ready!==true&&server?.telemetry?.cleanup==='complete';
+}
 
 function notice(key){noticeKey=key;$('notice').hidden=!key;$('notice').textContent=key?t(key):'';}
 function textStatus(){
-  if(state===States.IDLE)return 'initial';
+  if(state===States.IDLE||canRetryFailedStart())return 'initial';
   if(state===States.CONNECTING)return 'connecting';
   if(state===States.ENDING)return 'ending';
   if(state===States.ENDED||state===States.FAILED)return 'ended';
@@ -40,10 +45,11 @@ function render(){
   document.querySelectorAll('[data-copy]').forEach(element=>{element.textContent=t(element.dataset.copy).replace('{days}',String(retentionDays));});
   $('language').textContent=language==='ar'?'English':'العربية';$('language').lang=language==='ar'?'en':'ar';
   $('experience').dataset.state=state;$('experience').dataset.speaking=speaking??'';$('experience').setAttribute('aria-busy',state===States.CONNECTING?'true':'false');
-  const idle=state===States.IDLE||(state===States.FAILED&&!session),ended=[States.ENDED,States.REVOKED].includes(state)||(state===States.FAILED&&session);
+  const retry=canRetryFailedStart();
+  const idle=state===States.IDLE||(state===States.FAILED&&!session)||retry,ended=[States.ENDED,States.REVOKED].includes(state)||(state===States.FAILED&&session);
   $('startControls').hidden=!idle;$('liveControls').hidden=idle;
   $('create').disabled=!$('consent').checked||!readiness?.enabled||!isConfigured();
-  if(state===States.FAILED)$('create').querySelector('[data-copy]').textContent=t('tryAgain');
+  if(state===States.FAILED||retry)$('create').querySelector('[data-copy]').textContent=t('tryAgain');
   $('stop').hidden=ended;$('stop').disabled=state===States.ENDING;
   $('revoke').hidden=state===States.REVOKED||!session;$('revoke').disabled=state===States.ENDING;
   const savedVoice=state===States.ENDED&&server?.voice_ready===true&&session;
@@ -53,7 +59,7 @@ function render(){
   $('headline').textContent=idle?t('headline'):ended?t('endHeadline'):t('liveHeadline');
   $('intro').textContent=idle?t('intro'):ended?'':t('liveIntro');
   $('status').textContent=t(textStatus());
-  $('detail').textContent=state===States.REVOKED?t('revokedDetail'):state===States.ENDED?t('endedDetail'):state===States.CLONED_ACTIVE?t('activeDetail'):state===States.CONNECTING?t('mic'):idle?t('detail'):t('detail');
+  $('detail').textContent=idle?t('detail'):state===States.REVOKED?t('revokedDetail'):state===States.ENDED?t('endedDetail'):state===States.CLONED_ACTIVE?t('activeDetail'):state===States.CONNECTING?t('mic'):t('detail');
   const saved=Math.floor(Number(server?.eligible_audio_seconds)||0);
   $('progress').textContent=saved>0?t('progress').replace('{seconds}',String(saved)):'';
   $('diagnostics').hidden=!debugMode;
@@ -101,8 +107,12 @@ async function poll(){
   finally{pollRunning=false;}
 }
 async function create(){
-  if(state!==States.IDLE&&state!==States.FAILED)return;
+  const retry=canRetryFailedStart();
+  if(state!==States.IDLE&&!(state===States.FAILED&&!session)&&!retry)return;
   if(!$('consent').checked||!readiness?.enabled||!isConfigured())return;
+  // A definite rejected, empty call can start a new consented session only on
+  // this click. Refresh/uncertain creates and sessions with evidence never retry.
+  if(retry){session=null;rememberSession(null);}
   const currentEpoch=++epoch;notice(null);speaking=null;observedVoice=null;firstClonedSpeechReported=false;server=null;setState(States.CONNECTING);
   let stage='microphone';lastFailureStage=null;lastFailureName=null;lastFailureCode=null;
   try{
@@ -137,7 +147,10 @@ async function create(){
     clearInterval(pollTimer);clearTimeout(durationTimer);
     events?.stop();relayHealthy=false;
     await capture?.stop({save:false});await call?.stop();
-    if(session)await api('/sessions/'+session.id+'/end',{method:'POST',body:{}}).catch(()=>{});
+    if(session){
+      await api('/sessions/'+session.id+'/end',{method:'POST',body:{}}).catch(()=>{});
+      server=await api('/sessions/'+session.id).catch(()=>null);
+    }
     setState(States.FAILED);
     notice(['NotAllowedError','PermissionDeniedError'].includes(error.name)?'permission':['NotFoundError','NotReadableError'].includes(error.name)||(stage==='microphone'&&error.name==='NotSupportedError')||['recording_unsupported','sample_rate_unsupported'].includes(error.message)?'unsupported':'connectError');
   }
