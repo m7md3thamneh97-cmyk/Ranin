@@ -180,6 +180,9 @@ def test_consent_cookie_capability_isolated_and_no_secrets(setup):
     for forbidden in ('mock-vapi-private', 'mock-eleven-private', 'DO-NOT-COPY', 'control_url', 'webhook_hash', 'capability_hash', 'bootstrap_config'):
         assert forbidden not in result.text
     inline = fake.calls[-1][2]['assistant']
+    assert fake.calls[-1][:2] == ('POST', '/call/web')
+    assert fake.calls[-1][2]['roomDeleteOnUserLeaveEnabled'] is True
+    assert set(fake.calls[-1][2]) == {'assistant', 'roomDeleteOnUserLeaveEnabled'}
     assert 'tools' not in inline['model'] and 'toolIds' not in inline['model']
     assert 'credentialIds' not in inline
     assert 'Hi' in inline['firstMessage']

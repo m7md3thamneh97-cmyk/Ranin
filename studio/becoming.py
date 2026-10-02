@@ -318,8 +318,11 @@ class BecomingService:
             self.current(ident)
             self.store.execute('UPDATE becoming_sessions SET bootstrap_config=?,webhook_hash=? WHERE id=?', (compact(config), token_hash(webhook_secret), ident))
             call_dispatched = True
-            result = await self.providers.vapi_json(api_key, 'POST', '/call', json_body={'assistant': config,
-                'transport': {'provider': 'daily', 'roomDeleteOnUserLeaveEnabled': True}})
+            # Match Vapi's web SDK contract. The general /call route applies phone
+            # destination policy even when the DTO accepts a Daily transport.
+            # Never fall back or retry creates: this remains the one paid operation.
+            result = await self.providers.vapi_json(api_key, 'POST', '/call/web', json_body={'assistant': config,
+                'roomDeleteOnUserLeaveEnabled': True})
             if not isinstance(result, dict):
                 raise ProviderError('Vapi returned an invalid web conversation.', uncertain=True)
             provider_id = result.get('id'); transport = result.get('transport') or {}; monitor = result.get('monitor') or {}
