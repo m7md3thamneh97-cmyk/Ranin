@@ -1,9 +1,12 @@
+import { openSavedVoice } from "./enrollment-saved-voice-ui.js";
 import { InterviewCapture } from "./enrollment-capture.js";
 import { copy } from "./enrollment-copy.js";
 import { workflowFailure as explainWorkflowFailure } from "./enrollment-errors.js";
 import { icon, orb, uiText, learningPanel } from "./conversation-ui.js";
 import { ConversationFeed, semanticEvents } from "./conversation-events.js";
 import { LearningConnection, learningBinding } from "./learning-api.js";
+import { testerText, testerFailure, signInWithCode, saveTesterCode, showTesterInvitations } from "./tester-access-ui.js";
+import { confirmedResponseCount, needsResponseTeaching, hasPendingSpokenReview, spokenReviewMessage } from "./enrollment-evidence-status.js";
 // Retire the earlier enrollment credential cache. This flow keeps access in memory.
 try {
   sessionStorage.removeItem("raneen-token");
@@ -13,6 +16,8 @@ const q = (s) => document.querySelector(s),
 const S = {
   lang: "ar",
   token: "",
+  account: null,
+  testing: null,
   page: "login",
   sessions: [],
   session: null,
@@ -42,7 +47,10 @@ const remote = new Audio();
 remote.autoplay = true;
 const feed = new ConversationFeed();
 const learning = new LearningConnection(request);
-const t = (key) => copy[S.lang][key] ?? key;
+const t = (key) => key === "owner" && S.account?.role === "tester"
+  ? testerText(S.lang, "preview")
+  : key === "footer" ? testerText(S.lang, "footer")
+  : copy[S.lang][key] ?? key;
 const u = (key) => uiText(S.lang, key);
 const esc = (v) =>
   String(v ?? "").replace(
@@ -64,6 +72,8 @@ function notice(message, error = false) {
   notice.timer = setTimeout(() => (n.className = ""), 9000);
 }
 function explain(e) {
+  const accessFailure = testerFailure(S.lang, e);
+  if (accessFailure) return accessFailure;
   const names = {
     NotAllowedError: "denied",
     NotFoundError: "missing",
@@ -163,7 +173,7 @@ function shell(content, withSteps = false) {
   const controls = `<div class="header-actions"><button id="language" class="text-button" lang="${S.lang === "ar" ? "en" : "ar"}">${S.lang === "ar" ? "English" : "العربية"}</button>${S.token ? `<button id="signout" class="text-button">${t("signout")}</button><span class="avatar" aria-hidden="true">${S.lang === "ar" ? "ر" : "R"}</span>` : ""}</div>`;
   const footer = `<footer><span>${t("footer")}</span><span>Raneen · ${u("studio")}</span></footer>`;
   app.innerHTML = S.token
-    ? `<a class="skip-link" href="#workspaceContent">${u("conversation")}</a><div class="shell"><aside class="app-sidebar">${brand()}<p class="sidebar-section-label">${u("workspace")}</p><nav class="app-nav" aria-label="${u("workspace")}"><button class="nav-item active" id="navConversation" aria-current="page">${icon("conversation")}${u("conversation")}</button><button class="nav-item" id="navHistory">${icon("history")}${u("history")}</button><button class="nav-item" id="navSettings">${icon("sliders")}${u("settings")}</button></nav><div class="sidebar-bottom"><a class="nav-item sidebar-tools" href="/advanced">${icon("sliders")}${u("tools")}</a><div class="sidebar-note">${icon("shield")}${u("private")}</div></div></aside><div class="workspace-main"><header class="topbar">${brand("mobile-brand")}<div class="topbar-title">${u("conversation")}<span>${u(S.page === "agent" ? "practice" : S.page === "prepare" ? "voiceReview" : "workspace")}</span></div>${controls}</header><div id="workspaceContent" tabindex="-1" class="page-content ${S.page}-page">${content}${footer}</div></div></div>`
+    ? `<a class="skip-link" href="#workspaceContent">${u("conversation")}</a><div class="shell"><aside class="app-sidebar">${brand()}<p class="sidebar-section-label">${u("workspace")}</p><nav class="app-nav" aria-label="${u("workspace")}"><button class="nav-item active" id="navConversation" aria-current="page">${icon("conversation")}${u("conversation")}</button><button class="nav-item" id="navVoice">${icon("wave")}${t("myVoice")}</button><button class="nav-item" id="navHistory">${icon("history")}${u("history")}</button><button class="nav-item" id="navSettings">${icon("sliders")}${u("settings")}</button></nav><div class="sidebar-bottom">${S.account?.role === "admin" ? `<a class="nav-item sidebar-tools" href="/advanced">${icon("sliders")}${u("tools")}</a>` : ""}<div class="sidebar-note">${icon("shield")}${u("private")}</div></div></aside><div class="workspace-main"><header class="topbar">${brand("mobile-brand")}<div class="topbar-title">${u("conversation")}<span>${u(S.page === "agent" ? "practice" : S.page === "prepare" ? "voiceReview" : "workspace")}</span></div>${controls}</header><div id="workspaceContent" tabindex="-1" class="page-content ${S.page}-page">${content}${footer}</div></div></div>`
     : `<div class="shell login-shell"><header class="topbar">${brand()}${controls}</header>${content}${footer}</div>`;
   bind("#language", () => {
     if (S.busy || S.call) {
@@ -193,6 +203,7 @@ function shell(content, withSteps = false) {
     if (["interview", "prepare", "agent"].includes(S.page)) return;
     if (await leave()) await home();
   });
+  bind("#navVoice", showMyVoice);
   bind("#navHistory", showHistory);
   bind("#navSettings", showSettings);
   if (pageChanged) window.scrollTo({ top: 0, behavior: "instant" });
@@ -216,21 +227,23 @@ function render() {
 function login(error = "") {
   S.page = "login";
   shell(
-    `<div class="login-layout"><section class="login-visual"><p class="eyebrow">${u("tag")}</p><h1>${u("loginTitle")}</h1><p class="lead">${u("loginText")}</p>${orb()}<p class="login-note">${u("loginNote")}</p></section><div><form id="loginForm" class="login-card"><h2>${t("access")}</h2><p>${t("accessText")}</p>${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}<label for="token">${t("code")}</label><input id="token" type="password" required autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="codeNote"><p id="codeNote">${t("codeNote")}</p><button class="primary" id="login" type="submit">${t("continue")}${icon("arrow")}</button></form><p class="login-privacy">${icon("shield")}${u("private")}</p></div></div>`,
+    `<div class="login-layout"><section class="login-visual"><p class="eyebrow">${u("tag")}</p><h1>${u("loginTitle")}</h1><p class="lead">${u("loginText")}</p>${orb()}<p class="login-note">${u("loginNote")}</p></section><div><form id="loginForm" class="login-card"><h2>${t("access")}</h2><p>${testerText(S.lang, "login")}</p>${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}<label for="token">${t("code")}</label><input id="token" type="password" required autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="codeNote"><p id="codeNote">${t("codeNote")}</p><button class="primary" id="login" type="submit">${t("continue")}${icon("arrow")}</button></form><p class="login-privacy">${icon("shield")}${u("private")}</p></div></div>`,
   );
   q("#loginForm").onsubmit = async (e) => {
     e.preventDefault();
     const b = q("#login");
     if (b.disabled) return;
     b.disabled = true;
-    S.token = q("#token").value.trim();
+    const code = q("#token").value.trim();
     q("#token").value = "";
     try {
-      const u = await request("/api/me");
-      if (u.role !== "admin") throw Object.assign(Error(), { status: 403 });
+      const result = await signInWithCode({ code, request, post, setToken: token => { S.token = token; } });
+      S.account = result.user;
+      if (result.newToken) await saveTesterCode({ dialog, lang: S.lang, token: result.newToken });
       await home();
     } catch (e) {
       S.token = "";
+      S.account = null;
       login(explain(e));
     }
   };
@@ -241,6 +254,7 @@ async function home() {
   const r = await request("/api/enrollment/sessions");
   S.sessions = r.sessions;
   S.enabled = r.enabled;
+  S.testing = await request("/api/testing/access");
   const readiness = await request("/api/enrollment/readiness");
   S.config = {
     interview: readiness.interview_configured,
@@ -256,9 +270,10 @@ function renderHome() {
     (s) => !s.revoked && !["complete", "failed"].includes(s.state),
   );
   shell(
-    `<div class="home-layout"><section><div class="home-hero"><div class="home-hero-text"><p class="eyebrow">${u("tag")}</p><h1>${u("homeTitle")}</h1><p class="lead">${latest ? u("resumeText") : u("homeText")}</p></div>${orb()}<button id="mainAction" class="primary" ${!latest && !S.enabled ? "disabled" : ""}>${latest ? (S.enabled ? t("resume") : t("view")) : u("talk")}</button><div class="home-caption">${icon(latest ? "history" : "mic")}${latest ? `${u("saved")} · ${fmt(latest.saved_audio_ms)}` : u("listeningHelp")}</div>${!S.enabled ? `<p class="status-note">${t("disabled")}</p>` : ""}<div class="prompt-card"><span>${u("promptLabel")}</span><blockquote>${u("prompt")}</blockquote><p>${u("promptNote")}</p></div></div><div class="home-secondary">${icon("shield")}<div><strong>${u("privacy")}</strong>${u("privacyText")}</div></div></section>${learningPanel({ lang: S.lang, journey: latest || {}, workflow: { voice_state: latest?.voice_state } })}</div>${S.config && !S.config.interview ? configurationCard(S.config) : ""}${S.sessions.length ? `<section class="history-section"><h2>${u("recent")}</h2>${sessionList(S.sessions.slice(0, 3))}</section>` : ""}`,
+    `<div class="home-layout"><section><div class="home-hero"><div class="home-hero-text"><p class="eyebrow">${u("tag")}</p><h1>${u("homeTitle")}</h1><p class="lead">${latest ? u("resumeText") : u("homeText")}</p></div>${orb()}<button id="mainAction" class="primary" ${!latest && !S.enabled ? "disabled" : ""}>${latest ? (S.enabled ? t("resume") : t("view")) : u("talk")}</button>${S.sessions.some(s => !s.revoked && s.voice_state === "ready") ? `<button id="homeVoice" class="secondary">${icon("wave")}${t("myVoice")}</button>` : ""}<div class="home-caption">${icon(latest ? "history" : "mic")}${latest ? `${u("saved")} · ${fmt(latest.saved_audio_ms)}` : u("listeningHelp")}</div>${!S.enabled ? `<p class="status-note">${t("disabled")}</p>` : ""}<div class="prompt-card"><span>${u("promptLabel")}</span><blockquote>${u("prompt")}</blockquote><p>${u("promptNote")}</p></div></div><div class="home-secondary">${icon("shield")}<div><strong>${u("privacy")}</strong>${u("privacyText")}</div></div></section>${learningPanel({ lang: S.lang, journey: latest || {}, workflow: { voice_state: latest?.voice_state } })}</div>${S.config && !S.config.interview ? configurationCard(S.config) : ""}${S.sessions.length ? `<section class="history-section"><h2>${u("recent")}</h2>${sessionList(S.sessions.slice(0, 3))}</section>` : ""}`,
   );
   bind("#mainAction", () => (latest ? openSession(latest.id) : consent()));
+  bind("#homeVoice", showMyVoice);
   app
     .querySelectorAll("[data-session]")
     .forEach(
@@ -268,7 +283,16 @@ function renderHome() {
 function sessionList(sessions) {
   return `<ul class="session-list">${sessions.map((s, i) => `<li><div><strong>${u("savedSession")} ${i + 1}</strong><p>${s.revoked ? t("revoked") : t("saved")} · <span dir="ltr">${fmt(s.saved_audio_ms)}</span>${s.created ? ` · <span class="session-date">${esc(new Date(s.created).toLocaleDateString(S.lang === "ar" ? "ar-AE" : "en-GB", { day: "numeric", month: "short" }))}</span>` : ""}</p></div><button class="secondary" data-session="${esc(s.id)}">${t("open")}</button></li>`).join("")}</ul>`;
 }
+function showMyVoice() {
+  if (S.busy || S.call || S.capture?.stream || S.capture?.starting) {
+    notice(t("callAway"), true);
+    return;
+  }
+  stopSamples();
+  return openSavedVoice({ request, dialog, text: t, escape: esc });
+}
 function dialog(title, body) {
+  q("#workspaceDialog")?.close();
   q("#workspaceDialog")?.remove();
   const d = document.createElement("dialog");
   d.id = "workspaceDialog";
@@ -333,10 +357,16 @@ async function showHistory() {
   }
 }
 function showSettings() {
-  dialog(
+  const d = dialog(
     u("workspaceTitle"),
-    `<p>${u("workspaceText")}</p>${configurationCard(S.workflow?.config || S.config)}<p class="small">${u("readinessNote")}</p><div class="modal-footer">${icon("shield")} ${u("privacyText")}<p><a href="/advanced">${u("tools")}</a></p></div>`,
+    `<p>${u("workspaceText")}</p>${configurationCard(S.workflow?.config || S.config)}<p class="small">${u("readinessNote")}</p>${S.testing?.can_invite ? `<button id="inviteTester" class="primary">${testerText(S.lang, "invite")}</button>` : ""}<div class="modal-footer">${icon("shield")} ${u("privacyText")}${S.account?.role === "admin" ? `<p><a href="/advanced">${u("tools")}</a></p>` : ""}</div>`,
   );
+  const invite = d.querySelector("#inviteTester");
+  if (invite) invite.onclick = async () => {
+    d.close();
+    try { await showTesterInvitations({ dialog, lang: S.lang, request, post, report }); }
+    catch (e) { report(e); }
+  };
 }
 async function consent() {
   S.consent = await request("/api/enrollment/consent");
@@ -569,7 +599,7 @@ function renderInterview() {
           ? t("correctionIntro")
           : u("conversationText"),
     ) +
-      `<div class="conversation-layout"><section class="conversation-main"><section class="card interview-card"><div class="interview-top"><span id="connectionStatus" class="pill" role="status">${t("off")}</span><div class="saved-clock">${u("saved")} <span id="savedMinutes" dir="ltr">${fmt(j.saved_audio_ms)}</span></div></div>${orb("orb")}<h2 id="interviewHint">${t("ready")}</h2><p id="interviewSupport">${t("reassurance")}</p><div id="uploadState" class="save-state" role="status"></div><p id="serverState" class="status-note" hidden></p><div class="actions"><button id="connect" class="primary">${t("start")}</button><button id="newInterview" class="primary" hidden>${t("newInterview")}</button><button id="pause" class="secondary" hidden>${t("pause")}</button><button id="finish" class="secondary">${t(S.correction ? "updateAgent" : "finish")}</button></div><p class="small muted">${t("target")}</p></section><details class="card conversation-details"><summary>${u("conversationLog")}</summary><div id="conversationFeed" class="transcript-feed" role="log" aria-label="${u("conversationLog")}"></div><p class="small muted">${t("transcriptNote")}</p></details><details class="card"><summary>${u("showMore")}</summary><p class="small muted">${t("headphones")}</p><p class="small muted">${t("durationNote")}</p><button id="retryUploads" class="secondary" hidden>${t("retry")}</button><button id="ackTail" class="secondary" hidden>${t("acknowledgeTail")}</button><button id="endPrevious" class="secondary" hidden>${t("endPrevious")}</button><button id="micCheck" class="text-button">${t("checkSound")}</button><h3>${t("latest")}</h3><div id="transcript" class="transcript" dir="auto">${esc(S.transcript || t("emptyTranscript"))}</div><p class="small muted">${t("patterns")}: <strong id="patterns">${j.confirmed_patterns || 0}</strong></p><button id="refresh" class="text-button">${t("refresh")}</button></details><div class="bottom-actions"><button id="backHome" class="text-button">${t("backHome")}</button>${j.revoked ? `<button id="cleanup" class="secondary">${t("cleanup")}</button>` : `<button id="revoke" class="text-button danger">${t("revoke")}</button>`}</div>${j.revoked ? `<p class="small muted">${t("cleanupNote")}</p>` : ""}</section>${learningPanel({ lang: S.lang, journey: j, workflow: S.workflow || {}, learning: S.learning, learningError: S.learningError })}</div>`,
+      `<div class="conversation-layout"><section class="conversation-main"><section class="card interview-card"><div class="interview-top"><span id="connectionStatus" class="pill" role="status">${t("off")}</span><div class="saved-clock">${u("saved")} <span id="savedMinutes" dir="ltr">${fmt(j.saved_audio_ms)}</span></div></div>${orb("orb")}<h2 id="interviewHint">${t("ready")}</h2><p id="interviewSupport">${t("reassurance")}</p><div id="spokenReview" class="status-note" role="status" hidden></div><div id="uploadState" class="save-state" role="status"></div><p id="serverState" class="status-note" hidden></p><div class="actions"><button id="connect" class="primary">${t("start")}</button><button id="newInterview" class="primary" hidden>${t("newInterview")}</button><button id="pause" class="secondary" hidden>${t("pause")}</button><button id="finish" class="secondary">${t(S.correction ? "updateAgent" : "finish")}</button></div><p class="small muted">${t("target")}</p></section><details class="card conversation-details"><summary>${u("conversationLog")}</summary><div id="conversationFeed" class="transcript-feed" role="log" aria-label="${u("conversationLog")}"></div><p class="small muted">${t("transcriptNote")}</p></details><details class="card"><summary>${u("showMore")}</summary><p class="small muted">${t("headphones")}</p><p class="small muted">${t("durationNote")}</p><button id="retryUploads" class="secondary" hidden>${t("retry")}</button><button id="ackTail" class="secondary" hidden>${t("acknowledgeTail")}</button><button id="endPrevious" class="secondary" hidden>${t("endPrevious")}</button><button id="micCheck" class="text-button">${t("checkSound")}</button><h3>${t("latest")}</h3><div id="transcript" class="transcript" dir="auto">${esc(S.transcript || t("emptyTranscript"))}</div><p class="small muted">${t("patterns")}: <strong id="patterns">${j.confirmed_patterns || 0}</strong></p><button id="refresh" class="text-button">${t("refresh")}</button></details><div class="bottom-actions"><button id="backHome" class="text-button">${t("backHome")}</button>${j.revoked ? `<button id="cleanup" class="secondary">${t("cleanup")}</button>` : `<button id="revoke" class="text-button danger">${t("revoke")}</button>`}</div>${j.revoked ? `<p class="small muted">${t("cleanupNote")}</p>` : ""}</section>${learningPanel({ lang: S.lang, journey: j, workflow: S.workflow || {}, learning: S.learning, learningError: S.learningError })}</div>`,
     true,
   );
   renderFeed();
@@ -750,6 +780,11 @@ function update() {
   q("#interviewSupport").textContent = t(
     live ? "liveNote" : connecting ? "permissionWait" : "reassurance",
   );
+  const review = q("#spokenReview");
+  review.hidden = !live || !hasPendingSpokenReview(j, S.workflow);
+  review.textContent = spokenReviewMessage(j, S.workflow, t);
+  if (!live && !connecting && needsResponseTeaching(j, S.workflow))
+    q("#interviewSupport").textContent = t("responseTeachingIntro");
   q("#newInterview").hidden =
     !j.resume_limit || live || connecting || j.revoked;
   q("#newInterview").disabled = !j.enabled || S.resuming || S.busy;
@@ -823,6 +858,8 @@ async function refresh() {
     j = await request(path("/journey"));
   if (id !== S.session || seq !== S.refreshSeq) return;
   S.journey = j;
+  if (S.workflow?.learning && j.learning)
+    S.workflow.learning.confirmed_evidence_count = j.learning.confirmed_evidence_count;
   if (j.revoked) clearLearning();
   S.capture?.queue.syncNextSeq(j.next_seq);
   if (S.page !== "interview") {
@@ -913,7 +950,7 @@ async function realtime(event, capture) {
   update();
   const base =
     "/api/enrollment/sessions/" + encodeURIComponent(capture.sessionId);
-  if (event.type === "raneen.connected")
+  if (event.type === "raneen.connected") {
     capture.send({
       type: "response.create",
       response: {
@@ -922,10 +959,14 @@ async function realtime(event, capture) {
             ? "The contributor has just tested their private personalized AI agent and wants to teach a correction. Ask what it said, what they would say instead, and why. Preserve the existing approved voice. Confirm the corrected response pattern aloud and record confirmed evidence. "
             : "") +
           (S.journey.chunk_count
-            ? "Welcome the contributor back briefly and continue from their previously confirmed examples. Avoid repeating introductions or setup instructions. Ask one natural question at a time. Do not claim a finished clone."
+            ? confirmedResponseCount(S.journey, S.workflow) === 0
+              ? "Welcome the contributor back briefly. Their microphone audio is saved, but no response pattern has completed spoken review yet. Ask them to demonstrate their own complete answer to one simple fictional real-estate customer question. After the answer, call propose_evidence for one concise useful pattern. Let the server read it back; ask them to confirm by saying exactly نعم احفظ هذا or Yes, save this, or correct it. Do not prolong the interview or ask them to repeat setup. Do not claim a finished response profile."
+              : "Welcome the contributor back briefly and continue from their previously confirmed examples. Avoid repeating introductions or setup instructions. Ask one natural question at a time. Do not claim a finished clone."
             : "Introduce yourself briefly as Raneen’s private AI interviewer. Ask in Arabic which language and dialect the contributor prefers, respect their spoken choice, and ask one natural question at a time. Do not claim a finished clone."),
       },
     });
+    await refresh();
+  }
   else if (
     event.type === "conversation.item.input_audio_transcription.completed"
   ) {
@@ -934,6 +975,11 @@ async function realtime(event, capture) {
     capture.lastItem = event.item_id;
     S.transcript = event.transcript || "";
     if (q("#transcript")) q("#transcript").textContent = S.transcript;
+    // The trusted server socket persists review state independently of the
+    // display transcript. Read that state; never infer approval from this event.
+    await refresh();
+  } else if (event.type === "response.done") {
+    await refresh();
   } else if (event.type === "error") notice(t("interviewerError"), true);
 }
 async function leave() {
@@ -993,6 +1039,8 @@ async function signout() {
   if (!(await leave())) return;
   clearInterval(S.poll);
   S.token = "";
+  S.account = null;
+  S.testing = null;
   S.session = null;
   S.capture = null;
   S.journey = null;
@@ -1005,6 +1053,7 @@ async function signout() {
   S.learning = null;
   S.learningError = false;
   learning.reset();
+  q("#workspaceDialog")?.close();
   q("#workspaceDialog")?.remove();
   clearSamples();
   login();
@@ -1119,6 +1168,7 @@ function renderPrepare() {
   );
   const readyForApproval = samplesReady && S.listened.size === 3;
   const review = samplesReady && !w.voice_approved;
+  const needsTeaching = needsResponseTeaching(S.journey, w);
   const status = workflowMessage(w);
   const cloneFailed =
     (w.voice_state === "failed" ||
@@ -1139,12 +1189,14 @@ function renderPrepare() {
   );
   shell(
     hero(
-      t(review ? "voiceReview" : "prepareTitle"),
-      t(review ? "voiceReviewText" : "prepareIntro"),
+      t(needsTeaching ? "responseTeachingTitle" : review ? "voiceReview" : "prepareTitle"),
+      t(needsTeaching ? "responseTeachingIntro" : review ? "voiceReviewText" : "prepareIntro"),
     ) +
       `<div class="conversation-layout"><section class="conversation-main"><section class="card preparation-card">${
         S.busy
           ? `<div class="working-mark" aria-hidden="true">ر</div><h2 role="status">${t(S.phase || "prepareWorking")}</h2><p>${t("prepareWorkingNote")}</p>`
+          : needsTeaching
+            ? `<button id="resumeTeaching" class="primary" ${!S.journey.enabled || blocked || !w.config?.interview || S.call ? "disabled" : ""}>${t("resumeTeaching")}</button>`
           : review
             ? `<div class="sample-list">${[
                 ["question", "questionSample"],
@@ -1177,6 +1229,7 @@ function renderPrepare() {
     }
   }
   bind("#prepareAgent", prepareAgent);
+  bind("#resumeTeaching", returnToTeaching);
   bind("#approveVoice", approveVoice);
   bind("#deferVoice", async () => {
     stopSamples();
@@ -1193,16 +1246,25 @@ function renderPrepare() {
       renderAgent();
     } else renderPrepare();
   });
-  bind("#returnInterview", async () => {
-    stopSamples();
-    await refresh();
-    S.page = "interview";
-    renderInterview();
-  });
+  bind("#returnInterview", returnToTeaching);
   bind("#revoke", revoke);
+}
+async function returnToTeaching() {
+  if (S.busy || S.call || S.resuming) return;
+  const id = S.session;
+  stopSamples();
+  await refresh();
+  if (S.session !== id || S.journey.revoked) return;
+  S.workflowError = "";
+  S.page = "interview";
+  renderInterview();
 }
 async function prepareAgent() {
   if (S.busy) return;
+  if (needsResponseTeaching(S.journey, S.workflow)) {
+    renderPrepare();
+    return;
+  }
   const id = S.session,
     base = path(),
     epoch = ++S.workflowEpoch;
@@ -1296,6 +1358,10 @@ async function approveVoice() {
     if (!active()) return;
     const w = await fetchWorkflow();
     if (!active() || !w) return;
+    if (needsResponseTeaching(S.journey, w)) {
+      S.page = "prepare";
+      return;
+    }
     const behavior = w.behavior_id
       ? { id: w.behavior_id }
       : await post(base + "/behavior", { approve: true });

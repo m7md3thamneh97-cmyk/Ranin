@@ -130,6 +130,80 @@ def start(c, owner):
     return r.json()["id"]
 
 
+def saved_voice(env, monkeypatch):
+    c, app, owner, _, fake = env
+    enable(monkeypatch)
+    sid = start(c, owner)
+    app.state.store.execute("UPDATE enrollment_sessions SET voice_id=?,voice_state='ready' WHERE id=?", ('voice_test_123456', sid))
+    samples = {}
+    for kind in ('question', 'number', 'correction'):
+        response = c.post(f'/api/enrollment/sessions/{sid}/preview', headers=auth(owner), json={'approve': True, 'kind': kind})
+        assert response.status_code == 200
+        samples[kind] = response.content
+    assert c.post(f'/api/enrollment/sessions/{sid}/voice-approval', headers=auth(owner), json={'approve': True}).status_code == 200
+    return sid, samples
+
+
+def test_saved_clone_playback_needs_no_new_provider_or_interview(env, monkeypatch):
+    c, app, owner, _, fake = env
+    sid, samples = saved_voice(env, monkeypatch)
+    before = len(fake.speech_calls)
+    monkeypatch.delenv('ELEVENLABS_API_KEY')
+    monkeypatch.setenv('RANEEN_VOICE_ENROLLMENT_ENABLED', '0')
+    base = f'/api/enrollment/sessions/{sid}/voice-samples'
+    assert c.get(base, headers=auth(owner)).json() == {'samples': list(samples)}
+    for kind, audio in samples.items():
+        response = c.get(base + '/' + kind, headers=auth(owner))
+        assert response.status_code == 200 and response.content == audio
+        assert response.headers['content-type'] == 'audio/mpeg'
+        assert response.headers['cache-control'] == 'no-store'
+    assert len(fake.speech_calls) == before and fake.clone_calls == 0 and fake.secret_calls == 0
+    assert not fake.vapi_calls
+    assert app.state.store.one('SELECT COUNT(*) AS n FROM enrollment_evidence WHERE session_id=?', (sid,))['n'] == 0
+
+
+@pytest.mark.parametrize('suffix', ['', '/question'])
+def test_saved_clone_playback_enforces_account_and_revocation(env, monkeypatch, suffix):
+    c, app, owner, other, fake = env
+    sid, _ = saved_voice(env, monkeypatch)
+    path = f'/api/enrollment/sessions/{sid}/voice-samples' + suffix
+    assert c.get(path).status_code == 401
+    assert c.get(path, headers=auth(other)).status_code == 403
+    assert c.post(f'/api/enrollment/sessions/{sid}/revoke', headers=auth(owner), json={'confirm': True}).status_code == 200
+    assert c.get(path, headers=auth(owner)).status_code == 410
+
+
+@pytest.mark.parametrize('problem', ['missing', 'corrupt', 'different_voice', 'uncompleted', 'scope'])
+def test_saved_clone_cannot_replay_invalid_audio_or_generate_replacements(env, monkeypatch, problem):
+    import json
+    c, app, owner, _, fake = env
+    sid, _ = saved_voice(env, monkeypatch)
+    base = f'/api/enrollment/sessions/{sid}/voice-samples'
+    # Find the isolated enrollment artifact root used by the application.
+    path = next(app.state.store.root.rglob('voice_test_123456-question.mp3'))
+    if problem == 'missing':
+        path.unlink()
+    elif problem == 'corrupt':
+        path.write_bytes(b'not the synthesized sample')
+    elif problem == 'different_voice':
+        app.state.store.execute('UPDATE enrollment_sessions SET voice_id=? WHERE id=?', ('other_voice', sid))
+    elif problem == 'uncompleted':
+        app.state.store.execute("UPDATE enrollment_operations SET state='outcome_unknown' WHERE session_id=? AND kind='voice_preview'", (sid,))
+    else:
+        scopes = json.loads(app.state.store.one('SELECT consent_json FROM enrollment_sessions WHERE id=?', (sid,))['consent_json'])
+        scopes['private_preview'] = False
+        app.state.store.execute('UPDATE enrollment_sessions SET consent_json=? WHERE id=?', (json.dumps(scopes), sid))
+    response = c.get(base + '/question', headers=auth(owner))
+    assert response.status_code == (409 if problem in {'corrupt', 'scope'} else 404)
+    metadata = c.get(base, headers=auth(owner))
+    if problem == 'scope':
+        assert metadata.status_code == 409
+    else:
+        assert 'question' not in metadata.json()['samples']
+    assert len(fake.speech_calls) == 3 and fake.clone_calls == 0
+    assert c.get(base + '/unknown', headers=auth(owner)).status_code == 422
+
+
 def upload(c, owner, sid, seq, duration=15000, payload=None):
     data = payload if payload is not None else synthetic_audio(seq=seq,duration=duration/1000)
     headers = auth(owner) | {
@@ -163,6 +237,7 @@ def confirm_pattern(c, owner, sid, suffix="1"):
     store.execute("INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET call_id=excluded.call_id,state='open'", (sid, call_id, "open", now(), now()))
     first, second = "synthetic-answer-" + suffix, "synthetic-approval-" + suffix
     evidence.mark_audio(sid, call_id, first)
+    c.app.state.enrollment_learning.note_mode(sid, call_id, first)
     evidence.mark_audio(sid, call_id, first, committed=True)
     evidence.record_transcript(sid, call_id, first, "لا، مليون ونص، مش مليونين.")
     proposal = evidence.propose(sid, call_id, "synthetic-tool-" + suffix, {
@@ -174,6 +249,7 @@ def confirm_pattern(c, owner, sid, suffix="1"):
     assert proposal["ok"]
     assert evidence.verify_readback(sid, call_id, proposal["challenge_nonce"], proposal["challenge_text"])
     evidence.mark_audio(sid, call_id, second)
+    c.app.state.enrollment_learning.note_mode(sid, call_id, second)
     evidence.mark_audio(sid, call_id, second, committed=True)
     result = evidence.record_transcript(sid, call_id, second, "Yes, save this.")
     assert result["status"] == "confirmed"

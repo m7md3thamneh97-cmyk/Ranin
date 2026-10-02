@@ -29,7 +29,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from studio.runtime import create_app
 import studio.enrollment as enrollment
-from studio.enrollment_evidence import RealtimeEvidenceBridge
+from studio.enrollment import LearningRealtimeEvidenceBridge
 
 
 ORIGIN = "https://raneen.test"
@@ -237,12 +237,19 @@ class SyntheticSideband:
     The actual provenance/readback/confirmation parser runs. No browser HTTP text
     upload is promoted into evidence, and no real OpenAI connection is opened.
     """
-    def __init__(self, app):
+    def __init__(self, app, *, hold_confirmation=False):
         self.app = app
         self.calls = []
+        self.hold_confirmation = hold_confirmation
+        self.pending_confirmation = None
         async def unexpected_failure(*args):
             raise AssertionError("Synthetic sideband failed")
-        self.parser = RealtimeEvidenceBridge(app.state.store, app.state.enrollment_evidence, on_failure=unexpected_failure)
+        self.parser = LearningRealtimeEvidenceBridge(
+            app.state.store, app.state.enrollment_evidence,
+            learning_bridge=app.state.enrollment_learning,
+            instructions=lambda session_id: "Synthetic enrollment instructions.",
+            on_failure=unexpected_failure,
+        )
 
     async def attach(self, session_id, call_id, api_key):
         assert api_key == "synthetic-openai-key"
@@ -268,7 +275,10 @@ class SyntheticSideband:
         }]}})
         challenge = next(item["response"] for item in messages if item["type"] == "response.create")
         readback = json.loads(challenge["instructions"].partition(": ")[2])
-        consume({"type": "response.done", "response": {"status": "completed", "metadata": challenge["metadata"], "output": [{"role": "assistant", "content": [{"type": "audio", "transcript": readback}]}]}})
+        consume({"type": "response.done", "response": {"id": "synthetic-review-" + str(len(self.calls)), "status": "completed", "metadata": challenge["metadata"], "output": [{"type": "message", "status": "completed", "role": "assistant", "content": [{"type": "audio", "transcript": readback}]}]}})
+        if self.hold_confirmation:
+            self.pending_confirmation = lambda: spoken("synthetic-confirmation", "Yes, save this")
+            return
         spoken("synthetic-confirmation", "Yes, save this")
         confirmed = self.app.state.enrollment_evidence.confirmed_rows(session_id)
         assert len(confirmed) == 1
@@ -276,6 +286,11 @@ class SyntheticSideband:
 
     async def close(self, session_id, call_id=None):
         return None
+
+    def confirm_pending(self):
+        assert self.pending_confirmation is not None
+        confirm, self.pending_confirmation = self.pending_confirmation, None
+        confirm()
 
     async def stop_all(self):
         return None
@@ -287,6 +302,7 @@ def main():
         if key.startswith(("OPENAI_", "ELEVENLABS_", "VAPI_", "RANEEN_")) and key != "RANEEN_UI_OUTPUT_DIR":
             os.environ.pop(key, None)
     os.environ["RANEEN_VOICE_ENROLLMENT_ENABLED"] = "1"
+    os.environ["RANEEN_TESTER_ACCESS_ENABLED"] = "1"
     os.environ["OPENAI_API_KEY"] = "synthetic-openai-key"
     os.environ["ELEVENLABS_API_KEY"] = "synthetic-eleven-key"
     os.environ["VAPI_API_KEY"] = "synthetic-vapi-key"
@@ -301,6 +317,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="raneen-ui-") as data_dir:
         app = create_app(data_dir, public_origin=ORIGIN, owner_only=True)
         owner = app.state.store.create_user("Synthetic UI owner", "admin")
+        app.state.store.execute("UPDATE users SET id='deployment-owner' WHERE id=?", (owner["id"],))
+        owner["id"] = "deployment-owner"
         fake = SyntheticProvider()
         app.state.enrollment_provider = fake
         app.state.enrollment_sideband = SyntheticSideband(app)
@@ -316,6 +334,7 @@ def main():
             session_create_requests = []
             clone_requests = []
             preview_requests = []
+            behavior_requests = []
             faults = {"clone_shortfall": False}
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.on("console", lambda item: csp_errors.append(item.text) if item.type == "error" and "Content Security Policy" in item.text else None)
@@ -336,6 +355,8 @@ def main():
                     clone_requests.append((parsed.path, request.post_data_json))
                 if request.method == "POST" and parsed.path.endswith("/preview"):
                     preview_requests.append((parsed.path, request.post_data_json))
+                if request.method == "POST" and parsed.path.endswith("/behavior"):
+                    behavior_requests.append((parsed.path, request.post_data_json))
                 if request.method == "POST" and parsed.path.endswith("/clone") and faults["clone_shortfall"]:
                     faults["clone_shortfall"] = False
                     route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": {
@@ -516,6 +537,24 @@ def main():
                 assert len(fake.assistants) == 1
                 assert app.state.store.one("SELECT COUNT(*) AS n FROM enrollment_voice_approvals")["n"] == 1
 
+                # Approved voices remain playable through the permanent studio
+                # control; this read-only path must not synthesize or reclone.
+                speech_before = len(fake.speech_calls)
+                clones_before = len(fake.clone_calls)
+                microphones_before = page.evaluate("window.__syntheticMedia.requested")
+                page.locator("#navVoice").click()
+                expect(page.locator('#workspaceDialog')).to_be_visible()
+                expect(page.locator('[data-saved-voice="question"]')).to_be_visible()
+                for kind in ('question', 'number', 'correction'):
+                    player = page.locator('[data-saved-voice="' + kind + '"]')
+                    player.evaluate('(audio) => audio.play()')
+                    page.wait_for_function('(kind) => document.querySelector(`[data-saved-voice="${kind}"]`).ended', arg=kind)
+                page.screenshot(path=str(output / 'enrollment-saved-clone-en.png'), full_page=True)
+                assert len(fake.speech_calls) == speech_before and len(fake.clone_calls) == clones_before
+                assert page.evaluate("window.__syntheticMedia.requested") == microphones_before
+                page.locator('#closeDialog').click()
+                expect(page.locator('#workspaceDialog')).to_have_count(0)
+
                 # The app owns a bounded server-created room. Only the SDK itself
                 # is synthetic; the frame, CSP, nonce and parent event path run.
                 page.locator("#startTest").click()
@@ -632,8 +671,65 @@ def main():
                 expect(page.locator("#approveVoice")).to_be_disabled()
                 assert len(voice_only.clone_calls) == 1 and len(voice_only.speech_calls) == 3
                 assert not voice_only.assistants and not voice_only.preview_calls
+                speech_before = len(voice_only.speech_calls)
+                page.locator('#navVoice').click()
+                expect(page.locator('[data-saved-voice="question"]')).to_be_visible()
+                assert len(voice_only.speech_calls) == speech_before
+                page.locator('#closeDialog').click()
                 assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
                 page.screenshot(path=str(output / "enrollment-voice-only-en.png"), full_page=True)
+
+                # An approved voice is not a confirmed response profile. Show a
+                # direct teaching action, without retrying voice creation or
+                # falsely promoting the saved recording into behavioral evidence.
+                for kind in ("question", "number", "correction"):
+                    page.locator("#sample-" + kind).evaluate("async audio => { audio.muted = true; await audio.play(); }")
+                    expect(page.locator("#heard-" + kind)).to_have_text("Listened")
+                os.environ["VAPI_API_KEY"] = "synthetic-vapi-key"
+                os.environ["RANEEN_VAPI_TEMPLATE_ID"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                behavior_before = len(behavior_requests)
+                clone_before = len(clone_requests)
+                page.locator("#approveVoice").click()
+                expect(page.locator("#resumeTeaching")).to_be_enabled()
+                expect(page.locator("h1")).to_have_text("Teach how you respond.")
+                expect(page.locator("#prepareAgent")).to_have_count(0)
+                assert len(behavior_requests) == behavior_before
+                assert len(clone_requests) == clone_before
+                assert not voice_only.assistants and not voice_only.preview_calls
+                refused = client.post("/api/enrollment/sessions/" + voice_session + "/behavior", headers=owner_headers, json={"approve": True})
+                assert refused.status_code == 409
+                assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
+                microphones_before = page.evaluate("window.__syntheticMedia.requested")
+                page.locator("#resumeTeaching").click()
+                expect(page.locator("#connect")).to_be_enabled()
+                expect(page.locator("#interviewSupport")).to_contain_text("Your voice is approved.")
+                assert page.evaluate("window.__syntheticMedia.requested") == microphones_before
+                assert not voice_only.opened, "Returning to teaching must not open the microphone or a paid interview"
+                assert len(clone_requests) == clone_before and len(behavior_requests) == behavior_before
+
+                # A fresh demonstration/readback/exact spoken approval enters
+                # through the trusted provider seam, then the same clone is used.
+                app.state.enrollment_sideband = SyntheticSideband(app, hold_confirmation=True)
+                page.locator("#connect").click()
+                expect(page.locator("#orb")).to_have_class(re.compile(r"\blive\b"))
+                expect(page.locator("#spokenReview")).to_be_visible()
+                expect(page.locator("#spokenReview")).to_contain_text("Yes, save this")
+                expect(page.locator("#spokenReview")).to_contain_text("After you hear the whole summary")
+                assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
+                app.state.enrollment_sideband.confirm_pending()
+                page.evaluate("window.__syntheticMedia.peer.channel.onmessage({data:JSON.stringify({type:'response.done'})})")
+                expect(page.locator("#learningConfirmed")).to_have_text("1")
+                expect(page.locator("#spokenReview")).to_be_hidden()
+                pause_saved()
+                page.locator("#finish").click()
+                expect(page.locator("#startTest")).to_be_enabled(timeout=30000)
+                assert len(voice_only.clone_calls) == 1 and len(voice_only.speech_calls) == 3
+                assert len(voice_only.assistants) == 1
+                assert len(app.state.enrollment_evidence.confirmed_rows(voice_session)) == 1
+                page.screenshot(path=str(output / "enrollment-evidence-recovery-en.png"), full_page=True)
+
+                # Return to the recorded interview before testing its allowance.
+                page.locator("#teachCorrection").click()
 
                 # An exhausted, already closed interview offers fresh consent,
                 # not a disabled Continue button or an implicit new recording.
@@ -642,12 +738,14 @@ def main():
                     "synthetic-exhausted-operation", voice_session, "realtime_call", "synthetic-exhausted-call",
                     "succeeded", "rtc_synthetic_exhausted", json.dumps({"consumed_seconds": 1800}), stamp, stamp,
                 ))
-                app.state.store.execute("INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?)", (
+                app.state.store.execute("INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET call_id=excluded.call_id,state=excluded.state,updated=excluded.updated", (
                     voice_session, "rtc_synthetic_exhausted", "closed", stamp, stamp,
                 ))
                 journey = client.get("/api/enrollment/sessions/" + voice_session + "/journey", headers=owner_headers).json()
                 assert journey["resume_limit"] == "time" and journey["can_resume"] is False
-                page.locator("#returnInterview").click()
+                page.locator("details:has(#refresh) > summary").click()
+                expect(page.locator("#refresh")).to_be_visible()
+                page.locator("#refresh").click()
                 expect(page.locator("#newInterview")).to_be_visible()
                 expect(page.locator("#newInterview")).to_be_enabled()
                 expect(page.locator("#connect")).to_be_hidden()
@@ -798,10 +896,87 @@ def main():
                 assert app.state.store.one("SELECT state FROM enrollment_operations WHERE id=?", (failed_preview_operation["id"],))["state"] == "failed"
                 assert len(app.state.store.all("SELECT id FROM enrollment_operations WHERE session_id=? AND kind='voice_preview'", (failed_session,))) == 4
                 page.screenshot(path=str(output / "enrollment-provider-retry-voice-review-en.png"), full_page=True)
+
+                # Owner-issued invitations create a distinct private account,
+                # never another admin or a shared owner enrollment.
+                page.reload()
+                sign_in_english()
+                page.locator("#navSettings").click()
+                page.locator("#inviteTester").click()
+                page.locator("#createTesterInvite").click()
+                expect(page.locator("#newTesterInvite input")).to_be_visible()
+                invitation = page.locator("#newTesterInvite input").input_value()
+                assert len(invitation) == 43
+                page.locator("#closeDialog").click()
+                page.locator("#signout").click()
+                expect(page.locator("#loginForm")).to_be_visible()
+                page.locator("#token").fill(invitation)
+                page.locator("#login").click()
+                expect(page.locator("#testerContinue")).to_be_visible()
+                tester_token = page.locator("#workspaceDialog input").input_value()
+                assert len(tester_token) == 43 and tester_token != invitation
+                page.locator("#testerContinue").click()
+                expect(page.locator("#mainAction")).to_be_visible()
+                expect(page.locator("[data-session]")).to_have_count(0)
+                expect(page.locator("a[href='/advanced']")).to_have_count(0)
+                tester_headers = {"Authorization": "Bearer " + tester_token, "Origin": ORIGIN}
+                tester_user = client.get("/api/me", headers=tester_headers).json()
+                assert tester_user["role"] == "tester" and tester_user["id"] != owner["id"]
+                assert client.get("/api/testing/invitations", headers=tester_headers).status_code == 403
+                assert client.get("/api/enrollment/sessions/" + voice_session, headers=tester_headers).status_code == 403
+                assert client.post("/api/testing/redeem", json={"code": invitation}).status_code == 401
+                tester_provider = SyntheticProvider()
+                app.state.enrollment_provider = tester_provider
+                app.state.enrollment_sideband = SyntheticSideband(app)
+                page.locator("#mainAction").click()
+                for selector in ("#own", "#record", "#external", "#clone", "#preview"):
+                    page.locator(selector).check()
+                page.locator("#accept").click()
+                page.locator("#checkMic").click()
+                page.locator("#micContinue").click()
+                page.locator("#connect").click()
+                expect(page.locator("#orb")).to_have_class(re.compile(r"\blive\b"))
+                expect(page.locator("#learningConfirmed")).to_have_text("1")
+                pause_saved()
+                tester_sessions = client.get("/api/enrollment/sessions", headers=tester_headers).json()["sessions"]
+                assert len(tester_sessions) == 1
+                tester_session = tester_sessions[0]["id"]
+                assert app.state.store.one("SELECT owner_id FROM enrollment_sessions WHERE id=?", (tester_session,))["owner_id"] == tester_user["id"]
+                page.locator("#finish").click()
+                expect(page.locator("#sample-question")).to_be_visible(timeout=30000)
+                for kind in ("question", "number", "correction"):
+                    page.locator("#sample-" + kind).evaluate("async audio => { audio.muted = true; await audio.play(); }")
+                    expect(page.locator("#heard-" + kind)).to_have_text("Listened")
+                page.locator("#approveVoice").click()
+                expect(page.locator("#startTest")).to_be_enabled(timeout=30000)
+                assert len(tester_provider.clone_calls) == 1 and len(tester_provider.assistants) == 1
+                page.screenshot(path=str(output / "enrollment-invited-tester-agent-en.png"), full_page=True)
+                page.locator("#startTest").click()
+                expect(page.locator("#callStatus")).to_have_text("Your agent is listening")
+                page.locator("#stopTest").click()
+                expect(page.locator("#startTest")).to_be_enabled()
+                page.reload()
+                expect(page.locator("#loginForm")).to_be_visible()
+                page.locator("#token").fill(tester_token)
+                page.locator("#login").click()
+                expect(page.locator("#mainAction")).to_be_visible()
+                assert client.get("/api/enrollment/sessions", headers=tester_headers).json()["sessions"][0]["id"] == tester_session
+                page.locator("#navSettings").click()
+                expect(page.locator("#inviteTester")).to_have_count(0)
+                page.locator("#closeDialog").click()
+                page.locator("#signout").click()
+                sign_in_english()
+                page.locator("#navSettings").click()
+                page.locator("#inviteTester").click()
+                page.locator("[data-revoke-invite]").click()
+                expect(page.locator("#testerInviteList")).to_contain_text("Revoked")
+                assert client.get("/api/enrollment/sessions", headers=tester_headers).status_code == 403
+                assert app.state.store.one("SELECT revoked_at FROM enrollment_sessions WHERE id=?", (tester_session,))["revoked_at"]
+                page.locator("#closeDialog").click()
                 assert not errors, errors
                 assert not csp_errors, csp_errors
                 assert not external_requests, external_requests
-                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, one-action interview recovery, trusted evidence, decoded audio, one-action voice preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, voice preparation without behavior/Vapi, exhausted-interview fresh consent, persisted clone/preview rejection with explicit retry and preserved audio/audit, mobile overflow and CSP.")
+                print("PASS: synthetic owner DOM/API sign-in, Arabic/English, consent, microphone check, one-action interview recovery, trusted evidence, decoded audio, one-action voice preparation, three played fresh samples, explicit approval, bounded frame call, spoken correction with voice reuse, feature-off withdrawal, voice preparation without behavior/Vapi, approved-voice zero-evidence teaching recovery with preserved clone, exhausted-interview fresh consent, persisted clone/preview rejection with explicit retry and preserved audio/audit, mobile overflow and CSP.")
                 print("Generated tones and private synthetic provider events only: no physical microphone, real provider call, real voice clone, or human voice-quality acceptance was tested.")
             except Exception:
                 page.screenshot(path=str(output / "enrollment-failure.png"), full_page=True)

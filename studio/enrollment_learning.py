@@ -14,7 +14,8 @@ import uuid
 from fastapi import HTTPException
 
 from .app import now, uid
-from .enrollment_evidence import AFFIRMATIONS, EvidenceService, normalized
+from .enrollment_evidence import (AFFIRMATIONS, EvidenceService, normalized,
+    MAX_SPOKEN_REVIEW_CHARS, SPOKEN_REVIEW_FORMAT, SPOKEN_REVIEW_SITUATION, SPOKEN_REVIEW_CONDITION)
 from .providers import LocalLearningProvider
 from .scenarios import BY_ID
 
@@ -80,7 +81,7 @@ def check_enrollment_binding(store, profile_id, user_id=None):
 def _trusted(store, evidence_id, enrollment_id, binding, *, allow_superseded=False):
     statuses = ('confirmed', 'superseded') if allow_superseded else ('confirmed',)
     evidence = store.one('''SELECT e.*,p.source_ordinal,p.confirmation_ordinal,p.call_id AS provenance_call_id,
-        p.confirmed_method,p.spoken_after_ordinal,p.replaces_id AS provenance_replaces_id
+        p.confirmed_method,p.spoken_after_ordinal,p.challenge_nonce,p.challenge_text,p.replaces_id AS provenance_replaces_id
         FROM enrollment_evidence e JOIN enrollment_evidence_provenance p ON p.evidence_id=e.id
         WHERE e.id=? AND e.session_id=?''', (evidence_id, enrollment_id))
     if not evidence or evidence['status'] not in statuses or evidence['confirmed_method'] != 'trusted_audio_exact_phrase':
@@ -100,6 +101,24 @@ def _trusted(store, evidence_id, enrollment_id, binding, *, allow_superseded=Fal
         return None
     if not all(isinstance(payload.get(k), str) and payload[k].strip() for k in ('situation', 'interpretation', 'change_condition')):
         return None
+    if any(key in payload for key in ('review_authority', 'spoken_review', 'draft_proposal')):
+        review = payload.get('spoken_review')
+        if payload.get('review_authority') != SPOKEN_REVIEW_FORMAT or not isinstance(review, dict):
+            return None
+        transcript, response_id = review.get('transcript'), review.get('response_id')
+        if (review.get('status') != 'completed' or review.get('call_id') != evidence['provenance_call_id']
+                or review.get('challenge_nonce') != evidence['challenge_nonce']
+                or type(review.get('spoken_after_ordinal')) is not int
+                or review.get('spoken_after_ordinal') != evidence['spoken_after_ordinal']
+                or not isinstance(response_id, str) or not 1 <= len(response_id) <= 180
+                or not isinstance(transcript, str) or not 1 <= len(transcript) <= MAX_SPOKEN_REVIEW_CHARS):
+            return None
+        if review.get('verbatim') is True:
+            if normalized(transcript) != normalized(evidence['challenge_text']) or any(normalized(payload[key]) not in normalized(transcript) for key in ('situation', 'interpretation', 'change_condition')):
+                return None
+        elif (review.get('verbatim') is not False or payload['interpretation'] != transcript
+                or payload['situation'] != SPOKEN_REVIEW_SITUATION or payload['change_condition'] != SPOKEN_REVIEW_CONDITION):
+            return None
     mode = store.one('SELECT * FROM enrollment_learning_audio_modes WHERE source_ordinal=? AND enrollment_id=?', (source['ordinal'], enrollment_id))
     if mode:
         capture_mode = mode['capture_mode']

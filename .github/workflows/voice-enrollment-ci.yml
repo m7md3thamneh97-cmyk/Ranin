@@ -29,8 +29,20 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Install audio validation dependency
+        timeout-minutes: 3
         run: |
+          # Keep transient package mirrors from stalling the validation job.
+          sudo tee /etc/apt/apt.conf.d/99-raneen-ci-timeouts > /dev/null <<'APT'
+          Acquire::Retries "0";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          APT
           if ! command -v ffmpeg >/dev/null; then
+            for apt_source_file in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/apt-mirrors.txt; do
+              if [ -f "$apt_source_file" ]; then
+                sudo sed -i -E 's#https?://(azure\.)?archive\.ubuntu\.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' "$apt_source_file"
+              fi
+            done
             sudo apt-get update
             sudo apt-get install --yes ffmpeg
           fi
@@ -42,13 +54,17 @@ jobs:
         run: node tests/enrollment_capture.mjs
       - name: Conversation event and learning contract assertions
         run: node tests/conversation_events.mjs
+      - name: Tester access credential handoff assertions
+        run: node tests/tester_access_ui.mjs
       - name: Syntax-check enrollment browser modules
         run: |
           node --check studio/static/enroll.js
           node --check studio/static/vapi-frame.js
           for module in studio/static/enrollment-*.js; do node --check "$module"; done
           for module in studio/static/conversation-*.js studio/static/learning-api.js; do node --input-type=module --check < "$module"; done
+          node --input-type=module --check < studio/static/tester-access-ui.js
       - name: Install synthetic browser test dependencies
+        timeout-minutes: 4
         run: |
           python -m pip install -r requirements-browser.txt
           python -m playwright install --with-deps chromium --only-shell

@@ -39,6 +39,7 @@ from .enrollment_provider_errors import (
     KNOWN_REJECTIONS, provider_failure, response_diagnostics, retryable_clone, sanitize_diagnostics, stored_failure,
 )
 from .enrollment_evidence import RealtimeEvidenceBridge
+from .tester_access import admit_paid_session, admit_session, admit_storage, bound_call_seconds, enabled as testing_enabled, grant_state, remaining_call_seconds, require_active
 
 FEATURE = "RANEEN_VOICE_ENROLLMENT_ENABLED"
 CONSENT_VERSION = "voice-enrollment-v1"
@@ -656,6 +657,12 @@ def install(app):
         return user
 
     def admin(user=Depends(actor)):
+        # Hosted middleware admits only explicitly invited testers. Keep the
+        # dependency equally guarded for local runs and direct route execution.
+        if user['role'] == 'tester':
+            if grant_state(store, user) == 'revoked':
+                raise HTTPException(403, 'This test access was revoked.')
+            return user
         if user["role"] != "admin":
             raise HTTPException(403, "Owner access required for Gate A.")
         return user
@@ -663,6 +670,9 @@ def install(app):
     def gate():
         if not _enabled():
             raise HTTPException(404, "Voice enrollment is not enabled on this release.")
+
+    def processing_enabled(user):
+        return _enabled() and (user['role'] != 'tester' or grant_state(store,user) == 'active')
 
     def own_session(ident: str, user, *, require_active=True):
         row = store.one("SELECT * FROM enrollment_sessions WHERE id=?", (ident,))
@@ -702,6 +712,7 @@ def install(app):
                 busy = db.execute("SELECT id FROM enrollment_operations WHERE session_id=? AND kind=? AND state IN ('dispatching','outcome_unknown')", (session_id,kind)).fetchone()
                 if busy:
                     raise HTTPException(409, "A provider operation is pending or uncertain; reconcile it before starting another.")
+                admit_paid_session(store, db, session_id)
             ident = uid()
             db.execute(
                 "INSERT INTO enrollment_operations VALUES(?,?,?,?,?,NULL,'{}',?,?)",
@@ -783,14 +794,14 @@ def install(app):
                 'interview_configured':bool(os.environ.get('OPENAI_API_KEY')),
                 'voice_configured':bool(os.environ.get('ELEVENLABS_API_KEY')),
                 'agent_configured':bool(os.environ.get('VAPI_API_KEY')),
-                'provider_access_verified':False,'owner_only':True}
+                'provider_access_verified':False,'owner_only':not testing_enabled(), 'invited_testing':testing_enabled()}
 
     @app.get("/api/enrollment/status")
     def status(user=Depends(actor)):
         return {
             "version": "1.0-a0",
             "enabled": _enabled(),
-            "owner_only": True,
+            "owner_only": not testing_enabled(),
             "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
             "elevenlabs_configured": bool(os.environ.get("ELEVENLABS_API_KEY")),
             "vapi_private_configured": bool(os.environ.get("VAPI_API_KEY")),
@@ -840,6 +851,7 @@ def install(app):
                     active = None
             ident = active["id"] if active else uid()
             if not active:
+                admit_session(store, db, user)
                 db.execute(
                     "INSERT INTO enrollment_sessions(id,owner_id,state,consent_version,consent_json,created,updated) VALUES(?,?,?,?,?,?,?)",
                     (ident, user["id"], "collecting", CONSENT_VERSION, _json(payload), stamp, stamp),
@@ -868,7 +880,7 @@ def install(app):
             summary_select + " WHERE s.owner_id=? ORDER BY s.updated DESC,s.id DESC LIMIT ?",
             (user["id"], limit),
         )
-        return {"sessions": [recovery_summary(row) for row in rows], "enabled": _enabled()}
+        return {"sessions": [recovery_summary(row) for row in rows], "enabled": processing_enabled(user)}
 
     @app.get("/api/enrollment/sessions/{ident}/journey")
     def get_journey(ident: str, user=Depends(admin)):
@@ -882,7 +894,7 @@ def install(app):
         live = store.one("SELECT state FROM enrollment_realtime_calls WHERE session_id=?", (ident,))
         provider_pending = bool(pending or (live and live["state"] in {"close_unknown","dispatching","outcome_unknown"}))
         result = journey_summary(
-            row, enabled=_enabled(), provider_pending=provider_pending,
+            row, enabled=processing_enabled(user), provider_pending=provider_pending,
             cleanup_state=cleanup_summary(ident) if row["revoked_at"] else "not_revoked",
             interview_call_state=live["state"] if live else "none",
         )
@@ -894,6 +906,7 @@ def install(app):
             result['can_resume'] = False
         if not row['revoked_at']:
             result['learning'] = app.state.enrollment_learning.journey(ident)
+            result['pending_review'] = app.state.enrollment_evidence.pending_review(ident)
         return result
 
     @app.get("/api/enrollment/sessions/{ident}")
@@ -979,6 +992,7 @@ def install(app):
                 ).fetchone()
                 if not fresh or fresh["revoked_at"] or not json.loads(fresh["consent_json"]).get("recording"):
                     raise HTTPException(409, "Enrollment consent was withdrawn before this chunk finalized.")
+                admit_storage(store, db, user, len(data))
                 preparing=db.execute("SELECT id FROM enrollment_operations WHERE session_id=? AND kind='voice_clone' AND state IN ('dispatching','outcome_unknown')",(ident,)).fetchone()
                 if preparing: raise HTTPException(409,'Voice preparation is in progress; the recording sample is frozen.')
                 if fresh["total_bytes"] + len(data) > SESSION_MAX:
@@ -1188,6 +1202,8 @@ training and do not claim to be the contributor. Session id: {ident}
             used_seconds = sum(json.loads(x['detail']).get('consumed_seconds',0) for x in previous)
             maximum = max(0,1800-used_seconds)
             if maximum < 10: raise HTTPException(429,'The 30-minute interview allowance is used.')
+            maximum = bound_call_seconds(store, db, user, maximum)
+            admit_paid_session(store, db, ident)
             db.execute("INSERT INTO enrollment_realtime_calls VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET call_id=excluded.call_id,state=excluded.state,started=excluded.started,updated=excluded.updated",(ident,reservation,'dispatching',now(),now()))
             db.execute("INSERT INTO enrollment_operations VALUES(?,?,?,?,?,NULL,'{}',?,?)",(reservation,ident,'realtime_call',reservation,'dispatching',now(),now()))
         safety_id = hashlib.sha256(("raneen:" + user["id"]).encode()).hexdigest()[:64]
@@ -1208,6 +1224,10 @@ training and do not claim to be the contributor. Session id: {ident}
         except Exception:
             await close_webrtc(ident,user)
             raise HTTPException(503,'The trusted interview connection could not be established. Please try again.') from None
+        maximum = remaining_call_seconds(store, user, maximum)
+        if maximum <= 0:
+            await close_webrtc(ident,user)
+            raise HTTPException(403, {'code':'tester_access_expired','message':'Your private test access expired while connecting. The call has been stopped.'})
         asyncio.create_task(close_realtime_later(ident, result["call_id"], maximum))
         return Response(result["sdp"], media_type="application/sdp", headers={"X-Raneen-Interview-Limit": str(maximum)})
 
@@ -1244,9 +1264,10 @@ training and do not claim to be the contributor. Session id: {ident}
         row = own_session(ident, user)
         app.state.enrollment_learning.sync_trusted(ident)
         learned_context = app.state.enrollment_learning.context(ident)
-        confirmed = app.state.enrollment_evidence.confirmed_rows(ident)
+        trusted_ids = {item['evidence_id'] for item in learned_context.get('enrollment_demonstrations', [])}
+        confirmed = [item for item in app.state.enrollment_evidence.confirmed_rows(ident) if item['id'] in trusted_ids]
         if not confirmed:
-            raise HTTPException(409, "No confirmed spoken evidence is available yet.")
+            raise HTTPException(409, {'code':'confirmed_evidence_required','message':'No confirmed spoken evidence is available yet.'})
         payload = {
             "evidence_origin": "trusted_audio_v1",
             "learning_contract": "raneen-backend-v1",
@@ -1258,7 +1279,10 @@ training and do not claim to be the contributor. Session id: {ident}
                     "id": x["id"],
                     "kind": x["kind"],
                     "source_item_id": x["source_item_id"],
-                    "demonstration": json.loads(x["payload"]),
+                    "demonstration": {
+                        key: value for key, value in json.loads(x["payload"]).items()
+                        if key in {"kind", "situation", "interpretation", "change_condition", "source_transcript", "replaces_id"}
+                    },
                     "confirmation_transcript": x["confirmation_transcript"],
                 }
                 for x in confirmed
@@ -1352,6 +1376,7 @@ training and do not claim to be the contributor. Session id: {ident}
             if session['voice_id']:
                 raise HTTPException(409, 'This enrollment already has its private voice; reuse it.')
             check_clone_attempt(operations, retry_failed)
+            admit_paid_session(store, db, session_id)
             attempt = len(operations) + 1
             # Source spans and their selection algorithm stay unchanged. The
             # separate provider-attempt metadata makes the immutable audit version
@@ -1423,6 +1448,7 @@ training and do not claim to be the contributor. Session id: {ident}
                 if not retry_failed or not allowed:
                     raise HTTPException(409, preview_failure(attempts[-1], len(attempts), allowed=allowed))
             attempt = len(attempts) + 1
+            admit_paid_session(store, db, session_id)
             base = f'{voice_id}:{kind}'
             key = base if attempt == 1 else base + ':attempt:' + str(attempt)
             operation_id, stamp = uid(), now()
@@ -1529,6 +1555,56 @@ training and do not claim to be the contributor. Session id: {ident}
             for sample in chosen:
                 Path(sample['path']).unlink(missing_ok=True)
 
+    def saved_voice_sample(row, kind):
+        # Playback is read-only: only completed synthesis for this exact clone
+        # can be served. Never turn a missing sample into another paid request.
+        operations = store.all("SELECT detail FROM enrollment_operations WHERE session_id=? AND kind='voice_preview' AND provider_id=? AND state='succeeded' ORDER BY updated DESC", (row['id'], row['voice_id']))
+        proof = next((json.loads(op['detail']) for op in operations if json.loads(op['detail']).get('kind') == kind), None)
+        if not proof or not row['voice_id'] or row['voice_state'] not in {'ready', 'sample_required'}:
+            raise HTTPException(404, 'Saved voice sample is not available.')
+        directory = (root / row['id'] / 'previews').resolve()
+        path = (directory / (row['voice_id'] + '-' + kind + '.mp3')).resolve()
+        if not path.is_relative_to(directory):
+            raise HTTPException(404, 'Saved voice sample is not available.')
+        try:
+            with path.open('rb') as stream:
+                audio = stream.read(16 * 1024 * 1024 + 1)
+        except OSError:
+            raise HTTPException(404, 'Saved voice sample is not available.') from None
+        if not audio or len(audio) > 16 * 1024 * 1024 or hashlib.sha256(audio).hexdigest() != proof.get('sha256'):
+            raise HTTPException(409, 'Saved voice sample needs review.')
+        return audio
+
+    def playable_voice(ident, user):
+        require_active(store, user)
+        row = own_session(ident, user)
+        consent(row, 'voice_cloning')
+        consent(row, 'private_preview')
+        return row
+
+    @app.get('/api/enrollment/sessions/{ident}/voice-samples')
+    def voice_samples(ident: str, user=Depends(admin)):
+        row = playable_voice(ident, user)
+        available = []
+        for kind in ('question', 'number', 'correction'):
+            try:
+                saved_voice_sample(row, kind)
+                available.append(kind)
+            except HTTPException as exc:
+                if exc.status_code not in (404, 409):
+                    raise
+        return {'samples': available}
+
+    @app.get('/api/enrollment/sessions/{ident}/voice-samples/{kind}')
+    def play_voice_sample(ident: str, kind: Literal['question', 'number', 'correction'], user=Depends(admin)):
+        row = playable_voice(ident, user)
+        audio = saved_voice_sample(row, kind)
+        # Recheck after reading so a withdrawal during disk access is respected.
+        current = playable_voice(ident, user)
+        if current['voice_id'] != row['voice_id']:
+            raise HTTPException(409, 'The saved voice changed. Check again.')
+        return Response(audio, media_type='audio/mpeg', headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
     @app.post("/api/enrollment/sessions/{ident}/preview")
     async def synth_preview(ident: str, body: PreviewRequest, user=Depends(admin)):
         from .enrollment_audio import validate_synthesized_audio, AudioValidationError
@@ -1544,6 +1620,7 @@ training and do not claim to be the contributor. Session id: {ident}
         preview_path = root / ident / "previews" / (row['voice_id'] + '-' + body.kind + ".mp3")
         if not fresh:
             if operation["state"] == "succeeded" and preview_path.is_file():
+                require_active(store,user)
                 return FileResponse(preview_path, media_type="audio/mpeg")
             raise HTTPException(409, {
                 'code': 'outcome_unknown' if operation['state'] in {'dispatching', 'outcome_unknown'} else 'voice_preview_failed',
@@ -1578,12 +1655,17 @@ training and do not claim to be the contributor. Session id: {ident}
             active = db.execute('SELECT revoked_at,voice_id FROM enrollment_sessions WHERE id=?', (ident,)).fetchone()
             if active['revoked_at'] or active['voice_id'] != row['voice_id']:
                 db.execute("UPDATE enrollment_operations SET state='cancelled',updated=? WHERE id=?",(now(),operation['id']))
-                raise HTTPException(410, 'Consent was withdrawn during speech preparation.')
-            preview_path.parent.mkdir(parents=True, exist_ok=True)
-            preview_path.write_bytes(audio)
-            db.execute("UPDATE enrollment_operations SET state='succeeded',provider_id=?,detail=?,updated=? WHERE id=?",(row['voice_id'],_json({'kind':body.kind,'sha256':hashlib.sha256(audio).hexdigest(),'quality':quality}),now(),operation['id']))
-            db.execute("UPDATE enrollment_sessions SET voice_state='ready',updated=? WHERE id=?",(now(),ident))
-            db.execute("UPDATE enrollment_voice_versions SET state='ready',updated=? WHERE session_id=? AND provider_voice_id=?",(now(),ident,row['voice_id']))
+                cancelled = True
+            else:
+                cancelled = False
+                preview_path.parent.mkdir(parents=True, exist_ok=True)
+                preview_path.write_bytes(audio)
+                db.execute("UPDATE enrollment_operations SET state='succeeded',provider_id=?,detail=?,updated=? WHERE id=?",(row['voice_id'],_json({'kind':body.kind,'sha256':hashlib.sha256(audio).hexdigest(),'quality':quality}),now(),operation['id']))
+                db.execute("UPDATE enrollment_sessions SET voice_state='ready',updated=? WHERE id=?",(now(),ident))
+                db.execute("UPDATE enrollment_voice_versions SET state='ready',updated=? WHERE session_id=? AND provider_voice_id=?",(now(),ident,row['voice_id']))
+        if cancelled:
+            raise HTTPException(410, 'Consent was withdrawn during speech preparation.')
+        require_active(store,user)
         return FileResponse(preview_path, media_type="audio/mpeg")
 
     @app.post('/api/enrollment/sessions/{ident}/voice-approval')
@@ -1725,6 +1807,7 @@ training and do not claim to be the contributor. Session id: {ident}
 
     def workflow(ident: str, user):
         row = own_session(ident,user,require_active=False)
+        enabled = processing_enabled(user)
         approved = bool(store.one('SELECT approved FROM enrollment_voice_approvals WHERE session_id=? AND voice_id=?',(ident,row['voice_id'])))
         operations = store.all("SELECT * FROM enrollment_operations WHERE session_id=? ORDER BY created,rowid",(ident,))
         matched = any(x['kind']=='vapi_assistant' and x['state']=='succeeded' and x['provider_id']==row['assistant_id'] and json.loads(x['detail']).get('behavior_id')==row['active_behavior_id'] for x in operations)
@@ -1736,7 +1819,7 @@ training and do not claim to be the contributor. Session id: {ident}
         clones = [x for x in operations if x['kind'] == 'voice_clone']
         clone_busy = any(x['state'] in {'dispatching', 'outcome_unknown'} for x in clones)
         last_clone = clones[-1] if clones else None
-        clone_retry_allowed = bool(_enabled() and not row['revoked_at'] and not row['voice_id'] and
+        clone_retry_allowed = bool(enabled and not row['revoked_at'] and not row['voice_id'] and
                                    not clone_busy and len(clones) < MAX_CLONE_ATTEMPTS and retryable_clone(last_clone))
         preview_busy = any(x['kind'] == 'voice_preview' and x['state'] in {'dispatching', 'outcome_unknown'} for x in operations)
         preview_retry_allowed = {}
@@ -1746,7 +1829,7 @@ training and do not claim to be the contributor. Session id: {ident}
         for kind in PREVIEW_TEXT:
             attempts = preview_attempts(operations, row['voice_id'] or '', kind)
             old = attempts[-1] if attempts else None
-            allowed = bool(_enabled() and not row['revoked_at'] and row['voice_id'] and not preview_busy and
+            allowed = bool(enabled and not row['revoked_at'] and row['voice_id'] and not preview_busy and
                            len(attempts) < MAX_CLONE_ATTEMPTS and preview_retry(old))
             preview_retry_allowed[kind] = allowed
             if old and old['state'] in {'failed', 'dispatching', 'outcome_unknown'}:
@@ -1756,12 +1839,13 @@ training and do not claim to be the contributor. Session id: {ident}
         stage = 'revoked' if row['revoked_at'] else 'blocked' if pending or row['voice_state']=='verification_required' else 'agent_ready' if matched and approved else 'voice_review' if row['voice_state'] in {'sample_required','ready'} else 'preparing' if failed_voice else 'collecting'
         config = {'interview':bool(os.environ.get('OPENAI_API_KEY')), 'voice':bool(os.environ.get('ELEVENLABS_API_KEY')), 'agent':bool(os.environ.get('VAPI_API_KEY'))}
         reason = 'Enrollment was revoked.' if row['revoked_at'] else 'A provider outcome needs reconciliation.' if pending else 'Provider voice verification is required.' if row['voice_state']=='verification_required' else None
-        result = {'stage':stage,'enabled':_enabled(),'config':config,'voice_state':row['voice_state'],'voice_approved':approved,'behavior_ready':trusted_behavior,'behavior_id':row['active_behavior_id'],'assistant_ready':matched,'assistant_matches_behavior':matched,'preview_allowed':_enabled() and not row['revoked_at'] and approved and matched and not pending and not (call and call['state'] in {'open','dispatching','close_unknown','outcome_unknown'}),'blocking_reason':reason,'operations':[{'kind':x['kind'],'state':x['state']} for x in operations], 'preview_call_state':call['state'] if call else 'none',
+        result = {'stage':stage,'enabled':enabled,'config':config,'voice_state':row['voice_state'],'voice_approved':approved,'behavior_ready':trusted_behavior,'behavior_id':row['active_behavior_id'],'assistant_ready':matched,'assistant_matches_behavior':matched,'preview_allowed':enabled and not row['revoked_at'] and approved and matched and not pending and not (call and call['state'] in {'open','dispatching','close_unknown','outcome_unknown'}),'blocking_reason':reason,'operations':[{'kind':x['kind'],'state':x['state']} for x in operations], 'preview_call_state':call['state'] if call else 'none',
                 'voice_failure': voice_failure, 'clone_retry_allowed': clone_retry_allowed,
                 'clone_attempts': len(clones), 'clone_attempt_limit': MAX_CLONE_ATTEMPTS,
                 'preview_retry_allowed': preview_retry_allowed}
         if not row['revoked_at']:
             result['learning'] = app.state.enrollment_learning.journey(ident)
+            result['pending_review'] = app.state.enrollment_evidence.pending_review(ident)
         return result
 
     @app.get('/api/enrollment/sessions/{ident}/workflow')
@@ -1824,6 +1908,12 @@ training and do not claim to be the contributor. Session id: {ident}
         own_session(ident,user,require_active=False)
         return await stop_preview_calls(ident)
 
+    async def close_expiring_preview(ident, call_key, delay):
+        await asyncio.sleep(delay)
+        current = store.one('SELECT state FROM enrollment_preview_calls WHERE id=? AND session_id=?',(call_key,ident))
+        if current and current['state'] in {'open','close_unknown'}:
+            await stop_preview_calls(ident)
+
     @app.post('/api/enrollment/sessions/{ident}/preview-call')
     async def create_preview_call(ident: str,body: ExternalApproval,user=Depends(admin)):
         gate()
@@ -1843,9 +1933,11 @@ training and do not claim to be the contributor. Session id: {ident}
             if busy: raise HTTPException(409,'Close or reconcile the previous test call first.')
             count = db.execute('SELECT COUNT(*) AS n FROM enrollment_preview_calls WHERE session_id=?',(ident,)).fetchone()['n']
             if count>=3: raise HTTPException(429,'The three-call private test allowance is used. Ask the owner to review usage.')
+            admit_paid_session(store, db, ident)
+            maximum = bound_call_seconds(store, db, user, 180)
             db.execute('INSERT INTO enrollment_preview_calls VALUES(?,?,?,?,NULL,NULL,?,?)',(call_key,ident,row['assistant_id'],'dispatching',now(),now()))
         try:
-            result = await app.state.enrollment_provider.vapi_json(api_key,'POST','/call',json_body={'assistantId':row['assistant_id'],'transport':{'provider':'daily','roomDeleteOnUserLeaveEnabled':True},'assistantOverrides':{'maxDurationSeconds':180,'monitorPlan':{'listenEnabled':False,'controlEnabled':True},'artifactPlan':{'recordingEnabled':False}}})
+            result = await app.state.enrollment_provider.vapi_json(api_key,'POST','/call',json_body={'assistantId':row['assistant_id'],'transport':{'provider':'daily','roomDeleteOnUserLeaveEnabled':True},'assistantOverrides':{'maxDurationSeconds':maximum,'monitorPlan':{'listenEnabled':False,'controlEnabled':True},'artifactPlan':{'recordingEnabled':False}}})
             if not isinstance(result,dict): raise ProviderError('Provider test-call response was invalid.',uncertain=True)
             provider_id=result.get('id')
             transport=result.get('transport') or {}; monitor=result.get('monitor') or {}
@@ -1870,7 +1962,13 @@ training and do not claim to be the contributor. Session id: {ident}
         if own_session(ident,user,require_active=False)['revoked_at']:
             await stop_preview_calls(ident)
             raise HTTPException(410,'Consent was withdrawn while creating this call.')
-        return {'call_id':provider_id,'web_call_url':room,'call_token':transport.get('callToken'),'max_duration_seconds':180}
+        maximum = remaining_call_seconds(store, user, maximum)
+        if maximum <= 0:
+            await stop_preview_calls(ident)
+            raise HTTPException(403, {'code':'tester_access_expired','message':'Your private test access expired while connecting. The call has been stopped.'})
+        if user['role'] == 'tester':
+            asyncio.create_task(close_expiring_preview(ident, call_key, maximum))
+        return {'call_id':provider_id,'web_call_url':room,'call_token':transport.get('callToken'),'max_duration_seconds':maximum}
 
     @app.post("/api/enrollment/sessions/{ident}/revoke")
     async def revoke(ident: str, body: RevokeRequest, user=Depends(admin)):
@@ -1907,6 +2005,23 @@ training and do not claim to be the contributor. Session id: {ident}
         if not row["revoked_at"]:
             raise HTTPException(409, "Cleanup is only available after revocation.")
         return {"provider_cleanup": await cleanup_provider_artifacts(ident)}
+
+    async def revoke_tester_enrollments(user_id):
+        user = store.one('SELECT id,name,role FROM users WHERE id=?', (user_id,))
+        results = []
+        if not user or user['role'] != 'tester':
+            return results
+        for session in store.all('SELECT id FROM enrollment_sessions WHERE owner_id=?', (user_id,)):
+            try:
+                result = await revoke(session['id'], RevokeRequest(confirm=True), user)
+                results.append({'session_id':session['id'],'provider_cleanup':result['provider_cleanup']})
+            except HTTPException:
+                # Enrollment revocation is already durable. Failed/unknown
+                # provider cleanup stays tracked and can be retried by the owner.
+                results.append({'session_id':session['id'],'provider_cleanup':'pending'})
+        return results
+
+    app.state.revoke_tester_enrollments = revoke_tester_enrollments
 
     # FastAPI skips on_event handlers when the foundation installs a custom
     # lifespan. Compose the existing durable-learning recovery with enrollment
