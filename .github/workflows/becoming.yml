@@ -1,0 +1,60 @@
+name: Single Conversation Regression
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'work/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RANEEN_UI_OUTPUT_DIR: ${{ runner.temp }}/raneen-synthetic-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install test dependencies and browser
+        run: |
+          python -m pip install -r requirements-browser.txt
+          python -m playwright install chromium --with-deps
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+      - name: Python regression suite
+        run: python -m pytest -q
+      - name: JavaScript regression suites and syntax
+        run: |
+          for test in tests/*.mjs; do node "$test"; done
+          for module in studio/static/become*.js; do node --check "$module"; done
+      - name: Single conversation browser regression (synthetic)
+        run: python tests/becoming_dom.py
+      - name: Existing enrollment browser regression (synthetic)
+        run: python tests/enrollment_dom.py
+      - name: Existing guided DOM regression (synthetic)
+        run: |
+          chromium_path="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+          if [ ! -e /usr/bin/chromium ]; then sudo ln -s "$chromium_path" /usr/bin/chromium; fi
+          sudo mkdir -p /mnt/data
+          sudo chown "$USER" /mnt/data
+          python tests/guided_dom.py
+      - name: Save synthetic interface screenshots
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: raneen-interface-synthetic
+          path: |
+            ${{ runner.temp }}/raneen-synthetic-ui
+            /mnt/data/raneen-guided-*.png
+          if-no-files-found: ignore
+          retention-days: 7

@@ -324,6 +324,8 @@ def install(app):
     def advanced():
         return FileResponse(static / 'index.html')
     def teaching_home():
+        if os.environ.get('RANEEN_BECOMING_ENABLED', '0').strip() == '1':
+            return FileResponse(static / 'become.html')
         if os.environ.get('RANEEN_PLATFORM_HOME', '0').strip() == '1':
             return RedirectResponse('/enroll', status_code=307)
         return FileResponse(static / 'guided.html')

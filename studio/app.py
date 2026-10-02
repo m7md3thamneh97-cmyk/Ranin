@@ -22,7 +22,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, Response, RedirectResponse
+from fastapi.responses import FileResponse, Response, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -230,17 +230,36 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             if request.headers.get('host', '') == 'healthcheck.railway.app' and request.url.path != '/healthz':
                 return Response('Not found.', status_code=404)
             # Validate before FastAPI reads an API request body. Never put credentials in URLs.
-            if request.url.path.startswith('/api/'):
+            becoming_path = bool(re.fullmatch(
+                r'/api/becoming/(?:readiness|sessions(?:/[0-9a-f]{32}(?:/(?:call|process|events|events-stream|end|revoke|voice-check|preflight|chunks/[0-9]{1,5}))?)?|provider/[0-9a-f]{32})',
+                request.url.path,
+            ))
+            if request.url.path.startswith('/api/') and not becoming_path:
                 credential = request.headers.get('authorization', '')
                 account = store.one('SELECT id,role FROM users WHERE token_hash=?', (token_hash(credential[7:]),)) if credential.startswith('Bearer ') and len(credential) <= 520 else None
                 if not account:
                     return Response('Authentication required.', status_code=401, headers={'Cache-Control': 'no-store'})
                 if owner_only and (account['role'] != 'admin' or (request.url.path == '/api/users' and request.method == 'POST')):
                     return Response('Owner-only staging. Employee access is not enabled.', status_code=403, headers={'Cache-Control': 'no-store'})
+        becoming_resource = re.fullmatch(r'/api/becoming/sessions/([0-9a-f]{32})(?:/(.*))?', request.url.path)
+        if becoming_resource:
+            service = getattr(app.state, 'becoming', None)
+            if service is None:
+                return Response('Conversation unavailable.', status_code=404)
+            action = becoming_resource.group(2)
+            try:
+                service.session(becoming_resource.group(1), request,
+                                active=action not in (None, 'end', 'revoke', 'voice-check'),
+                                mutation=request.method not in ('GET', 'HEAD', 'OPTIONS'))
+            except HTTPException as exc:
+                return JSONResponse({'detail': exc.detail}, status_code=exc.status_code,
+                                    headers={'Cache-Control': 'no-store'})
         max_size = MAX_AUDIO if '/audio' in request.url.path else MAX_JSON
         if request.method == 'PUT' and re.fullmatch(r'/api/enrollment/sessions/[0-9a-f]{32}/chunks/[0-9]{1,5}', request.url.path):
             from .enrollment import CHUNK_MAX
             max_size = CHUNK_MAX
+        if request.method == 'PUT' and re.fullmatch(r'/api/becoming/sessions/[0-9a-f]{32}/chunks/[0-9]{1,5}', request.url.path):
+            max_size = 256 * 1024
         length = request.headers.get('content-length')
         if request.method in ('POST', 'PUT', 'PATCH'):
             try:
@@ -260,7 +279,15 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Cache-Control'] = 'no-store'
-        if request.url.path == '/vapi-frame':
+        if request.url.path in ('/', '/create') and os.environ.get('RANEEN_BECOMING_ENABLED', '0').strip() == '1':
+            response.headers['Content-Security-Policy'] = (
+                "default-src 'self'; script-src 'self' "
+                "https://c.daily.co/call-machine/versioned/0.87.0/static/call-machine-object-bundle.js; "
+                "style-src 'self'; img-src 'self' data:; media-src 'self' blob: https://*.daily.co; "
+                "connect-src 'self' https://*.daily.co wss://*.daily.co; worker-src 'self' blob:; "
+                "frame-src https://*.daily.co; object-src 'none'; frame-ancestors 'none'; "
+                "base-uri 'self'; form-action 'self'")
+        elif request.url.path == '/vapi-frame':
             response.headers['Content-Security-Policy'] = ("default-src 'none'; script-src 'self' "
                 "https://c.daily.co/call-machine/versioned/0.87.0/static/call-machine-object-bundle.js; "
                 "style-src 'self' 'unsafe-inline'; connect-src 'self' https://*.daily.co wss://*.daily.co; "
@@ -331,6 +358,7 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
             'audio_decoder_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe')),
             'storage_available': shutil.disk_usage(store.root).free >= 256 * 1024 * 1024,
             'provider_access_verified': False,
+            'same_conversation_enabled': os.environ.get('RANEEN_BECOMING_ENABLED', '0').strip() == '1',
         }
 
     @app.get('/api/me')
@@ -591,9 +619,17 @@ def create_app(data_dir: Path | str | None = None, *, public_origin: str | None 
 
     @app.get('/')
     def index():
+        if os.environ.get('RANEEN_BECOMING_ENABLED', '0').strip() == '1':
+            return FileResponse(static / 'become.html')
         if os.environ.get('RANEEN_PLATFORM_HOME', '0').strip() == '1':
             return RedirectResponse('/enroll', status_code=307)
         return FileResponse(static / 'index.html')
+
+    @app.get('/create', include_in_schema=False)
+    def create_agent():
+        if os.environ.get('RANEEN_BECOMING_ENABLED', '0').strip() != '1':
+            raise HTTPException(503, 'The single-conversation experience is not enabled.')
+        return FileResponse(static / 'become.html')
 
     @app.get('/studio', include_in_schema=False)
     def legacy_studio():
