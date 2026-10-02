@@ -29,6 +29,17 @@ def test_invalid_json_discarded():
     assert rejection_hint(httpx.Response(400, content=b'PRIVATE-SECRET')) == ''
 
 
+def test_nested_account_error_retains_only_fixed_terms():
+    response = httpx.Response(400, json={'message': {'error':
+        'Account has insufficient credits for web call. PRIVATE-SECRET https://private.example/voice/123 "secret billing"'}})
+    assert rejection_hint(response) == ' Rejection terms: account, insufficient, credits, web, call.'
+
+
+def test_long_or_nested_unstructured_errors_are_bounded():
+    response = httpx.Response(400, json={'message': {'error': {'message': {'error': 'invalid credentials'}}}})
+    assert rejection_hint(response) == ''
+
+
 def test_adapter_stores_only_safe_hint_without_retry(monkeypatch):
     requests = []
     class Client:
