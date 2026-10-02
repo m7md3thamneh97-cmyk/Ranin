@@ -97,7 +97,7 @@ def authorize_request(store, user, path, method):
             _own_enrollment(store, user, ident)
             suffix = suffix or ''
             recovery = (method == 'GET' and suffix in {'', 'journey', 'workflow'}) or (method == 'POST' and suffix in {'webrtc-close', 'preview-call/close', 'revoke', 'cleanup'})
-            allowed = recovery or (method == 'GET' and suffix == 'quality') or (method == 'PUT' and bool(re.fullmatch(r'chunks/[0-9]{1,5}', suffix))) or (method == 'POST' and suffix in {'webrtc', 'behavior', 'clone', 'preview', 'voice-approval', 'assistant', 'preview-call'})
+            allowed = recovery or (method == 'GET' and (suffix == 'quality' or bool(re.fullmatch(r'voice-samples(?:/(question|number|correction))?', suffix)))) or (method == 'PUT' and bool(re.fullmatch(r'chunks/[0-9]{1,5}', suffix))) or (method == 'POST' and suffix in {'webrtc', 'behavior', 'clone', 'preview', 'voice-approval', 'assistant', 'preview-call'})
         elif method == 'GET':
             match = re.fullmatch(r'/api/profiles/([0-9a-f]{32})/learning-state', path)
             session_match = re.fullmatch(r'/api/sessions/([0-9a-f]{32})/events', path)

@@ -537,6 +537,24 @@ def main():
                 assert len(fake.assistants) == 1
                 assert app.state.store.one("SELECT COUNT(*) AS n FROM enrollment_voice_approvals")["n"] == 1
 
+                # Approved voices remain playable through the permanent studio
+                # control; this read-only path must not synthesize or reclone.
+                speech_before = len(fake.speech_calls)
+                clones_before = len(fake.clone_calls)
+                microphones_before = page.evaluate("window.__syntheticMedia.requested")
+                page.locator("#navVoice").click()
+                expect(page.locator('#workspaceDialog')).to_be_visible()
+                expect(page.locator('[data-saved-voice="question"]')).to_be_visible()
+                for kind in ('question', 'number', 'correction'):
+                    player = page.locator('[data-saved-voice="' + kind + '"]')
+                    player.evaluate('(audio) => audio.play()')
+                    page.wait_for_function('(kind) => document.querySelector(`[data-saved-voice="${kind}"]`).ended', arg=kind)
+                page.screenshot(path=str(output / 'enrollment-saved-clone-en.png'), full_page=True)
+                assert len(fake.speech_calls) == speech_before and len(fake.clone_calls) == clones_before
+                assert page.evaluate("window.__syntheticMedia.requested") == microphones_before
+                page.locator('#closeDialog').click()
+                expect(page.locator('#workspaceDialog')).to_have_count(0)
+
                 # The app owns a bounded server-created room. Only the SDK itself
                 # is synthetic; the frame, CSP, nonce and parent event path run.
                 page.locator("#startTest").click()
@@ -653,6 +671,11 @@ def main():
                 expect(page.locator("#approveVoice")).to_be_disabled()
                 assert len(voice_only.clone_calls) == 1 and len(voice_only.speech_calls) == 3
                 assert not voice_only.assistants and not voice_only.preview_calls
+                speech_before = len(voice_only.speech_calls)
+                page.locator('#navVoice').click()
+                expect(page.locator('[data-saved-voice="question"]')).to_be_visible()
+                assert len(voice_only.speech_calls) == speech_before
+                page.locator('#closeDialog').click()
                 assert app.state.enrollment_evidence.confirmed_rows(voice_session) == []
                 page.screenshot(path=str(output / "enrollment-voice-only-en.png"), full_page=True)
 

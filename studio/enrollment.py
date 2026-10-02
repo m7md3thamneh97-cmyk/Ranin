@@ -1555,6 +1555,56 @@ training and do not claim to be the contributor. Session id: {ident}
             for sample in chosen:
                 Path(sample['path']).unlink(missing_ok=True)
 
+    def saved_voice_sample(row, kind):
+        # Playback is read-only: only completed synthesis for this exact clone
+        # can be served. Never turn a missing sample into another paid request.
+        operations = store.all("SELECT detail FROM enrollment_operations WHERE session_id=? AND kind='voice_preview' AND provider_id=? AND state='succeeded' ORDER BY updated DESC", (row['id'], row['voice_id']))
+        proof = next((json.loads(op['detail']) for op in operations if json.loads(op['detail']).get('kind') == kind), None)
+        if not proof or not row['voice_id'] or row['voice_state'] not in {'ready', 'sample_required'}:
+            raise HTTPException(404, 'Saved voice sample is not available.')
+        directory = (root / row['id'] / 'previews').resolve()
+        path = (directory / (row['voice_id'] + '-' + kind + '.mp3')).resolve()
+        if not path.is_relative_to(directory):
+            raise HTTPException(404, 'Saved voice sample is not available.')
+        try:
+            with path.open('rb') as stream:
+                audio = stream.read(16 * 1024 * 1024 + 1)
+        except OSError:
+            raise HTTPException(404, 'Saved voice sample is not available.') from None
+        if not audio or len(audio) > 16 * 1024 * 1024 or hashlib.sha256(audio).hexdigest() != proof.get('sha256'):
+            raise HTTPException(409, 'Saved voice sample needs review.')
+        return audio
+
+    def playable_voice(ident, user):
+        require_active(store, user)
+        row = own_session(ident, user)
+        consent(row, 'voice_cloning')
+        consent(row, 'private_preview')
+        return row
+
+    @app.get('/api/enrollment/sessions/{ident}/voice-samples')
+    def voice_samples(ident: str, user=Depends(admin)):
+        row = playable_voice(ident, user)
+        available = []
+        for kind in ('question', 'number', 'correction'):
+            try:
+                saved_voice_sample(row, kind)
+                available.append(kind)
+            except HTTPException as exc:
+                if exc.status_code not in (404, 409):
+                    raise
+        return {'samples': available}
+
+    @app.get('/api/enrollment/sessions/{ident}/voice-samples/{kind}')
+    def play_voice_sample(ident: str, kind: Literal['question', 'number', 'correction'], user=Depends(admin)):
+        row = playable_voice(ident, user)
+        audio = saved_voice_sample(row, kind)
+        # Recheck after reading so a withdrawal during disk access is respected.
+        current = playable_voice(ident, user)
+        if current['voice_id'] != row['voice_id']:
+            raise HTTPException(409, 'The saved voice changed. Check again.')
+        return Response(audio, media_type='audio/mpeg', headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
     @app.post("/api/enrollment/sessions/{ident}/preview")
     async def synth_preview(ident: str, body: PreviewRequest, user=Depends(admin)):
         from .enrollment_audio import validate_synthesized_audio, AudioValidationError

@@ -178,7 +178,11 @@ def test_expired_grant_retains_own_stop_and_revoke_but_no_new_work(testing):
     _, tester = redeem(testing)
     sid = start(testing, tester)
     headers = auth(tester['token'])
+    assert client.get(f'/api/enrollment/sessions/{sid}/voice-samples', headers=headers).status_code == 200
+    assert client.get(f'/api/enrollment/sessions/{sid}/voice-samples/question', headers=headers).status_code == 404
     app.state.store.execute("UPDATE tester_grants SET expires_at='2000-01-01T00:00:00+00:00' WHERE user_id=?", (tester['user']['id'],))
+    assert client.get(f'/api/enrollment/sessions/{sid}/voice-samples', headers=headers).status_code == 403
+    assert client.get(f'/api/enrollment/sessions/{sid}/voice-samples/question', headers=headers).status_code == 403
     assert client.get('/api/me', headers=headers).status_code == 200
     assert client.get('/api/testing/access', headers=headers).json()['state'] == 'expired'
     workflow = client.get(f'/api/enrollment/sessions/{sid}/workflow', headers=headers).json()

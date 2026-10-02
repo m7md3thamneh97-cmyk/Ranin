@@ -1,3 +1,4 @@
+import { openSavedVoice } from "./enrollment-saved-voice-ui.js";
 import { InterviewCapture } from "./enrollment-capture.js";
 import { copy } from "./enrollment-copy.js";
 import { workflowFailure as explainWorkflowFailure } from "./enrollment-errors.js";
@@ -172,7 +173,7 @@ function shell(content, withSteps = false) {
   const controls = `<div class="header-actions"><button id="language" class="text-button" lang="${S.lang === "ar" ? "en" : "ar"}">${S.lang === "ar" ? "English" : "العربية"}</button>${S.token ? `<button id="signout" class="text-button">${t("signout")}</button><span class="avatar" aria-hidden="true">${S.lang === "ar" ? "ر" : "R"}</span>` : ""}</div>`;
   const footer = `<footer><span>${t("footer")}</span><span>Raneen · ${u("studio")}</span></footer>`;
   app.innerHTML = S.token
-    ? `<a class="skip-link" href="#workspaceContent">${u("conversation")}</a><div class="shell"><aside class="app-sidebar">${brand()}<p class="sidebar-section-label">${u("workspace")}</p><nav class="app-nav" aria-label="${u("workspace")}"><button class="nav-item active" id="navConversation" aria-current="page">${icon("conversation")}${u("conversation")}</button><button class="nav-item" id="navHistory">${icon("history")}${u("history")}</button><button class="nav-item" id="navSettings">${icon("sliders")}${u("settings")}</button></nav><div class="sidebar-bottom">${S.account?.role === "admin" ? `<a class="nav-item sidebar-tools" href="/advanced">${icon("sliders")}${u("tools")}</a>` : ""}<div class="sidebar-note">${icon("shield")}${u("private")}</div></div></aside><div class="workspace-main"><header class="topbar">${brand("mobile-brand")}<div class="topbar-title">${u("conversation")}<span>${u(S.page === "agent" ? "practice" : S.page === "prepare" ? "voiceReview" : "workspace")}</span></div>${controls}</header><div id="workspaceContent" tabindex="-1" class="page-content ${S.page}-page">${content}${footer}</div></div></div>`
+    ? `<a class="skip-link" href="#workspaceContent">${u("conversation")}</a><div class="shell"><aside class="app-sidebar">${brand()}<p class="sidebar-section-label">${u("workspace")}</p><nav class="app-nav" aria-label="${u("workspace")}"><button class="nav-item active" id="navConversation" aria-current="page">${icon("conversation")}${u("conversation")}</button><button class="nav-item" id="navVoice">${icon("wave")}${t("myVoice")}</button><button class="nav-item" id="navHistory">${icon("history")}${u("history")}</button><button class="nav-item" id="navSettings">${icon("sliders")}${u("settings")}</button></nav><div class="sidebar-bottom">${S.account?.role === "admin" ? `<a class="nav-item sidebar-tools" href="/advanced">${icon("sliders")}${u("tools")}</a>` : ""}<div class="sidebar-note">${icon("shield")}${u("private")}</div></div></aside><div class="workspace-main"><header class="topbar">${brand("mobile-brand")}<div class="topbar-title">${u("conversation")}<span>${u(S.page === "agent" ? "practice" : S.page === "prepare" ? "voiceReview" : "workspace")}</span></div>${controls}</header><div id="workspaceContent" tabindex="-1" class="page-content ${S.page}-page">${content}${footer}</div></div></div>`
     : `<div class="shell login-shell"><header class="topbar">${brand()}${controls}</header>${content}${footer}</div>`;
   bind("#language", () => {
     if (S.busy || S.call) {
@@ -202,6 +203,7 @@ function shell(content, withSteps = false) {
     if (["interview", "prepare", "agent"].includes(S.page)) return;
     if (await leave()) await home();
   });
+  bind("#navVoice", showMyVoice);
   bind("#navHistory", showHistory);
   bind("#navSettings", showSettings);
   if (pageChanged) window.scrollTo({ top: 0, behavior: "instant" });
@@ -268,9 +270,10 @@ function renderHome() {
     (s) => !s.revoked && !["complete", "failed"].includes(s.state),
   );
   shell(
-    `<div class="home-layout"><section><div class="home-hero"><div class="home-hero-text"><p class="eyebrow">${u("tag")}</p><h1>${u("homeTitle")}</h1><p class="lead">${latest ? u("resumeText") : u("homeText")}</p></div>${orb()}<button id="mainAction" class="primary" ${!latest && !S.enabled ? "disabled" : ""}>${latest ? (S.enabled ? t("resume") : t("view")) : u("talk")}</button><div class="home-caption">${icon(latest ? "history" : "mic")}${latest ? `${u("saved")} · ${fmt(latest.saved_audio_ms)}` : u("listeningHelp")}</div>${!S.enabled ? `<p class="status-note">${t("disabled")}</p>` : ""}<div class="prompt-card"><span>${u("promptLabel")}</span><blockquote>${u("prompt")}</blockquote><p>${u("promptNote")}</p></div></div><div class="home-secondary">${icon("shield")}<div><strong>${u("privacy")}</strong>${u("privacyText")}</div></div></section>${learningPanel({ lang: S.lang, journey: latest || {}, workflow: { voice_state: latest?.voice_state } })}</div>${S.config && !S.config.interview ? configurationCard(S.config) : ""}${S.sessions.length ? `<section class="history-section"><h2>${u("recent")}</h2>${sessionList(S.sessions.slice(0, 3))}</section>` : ""}`,
+    `<div class="home-layout"><section><div class="home-hero"><div class="home-hero-text"><p class="eyebrow">${u("tag")}</p><h1>${u("homeTitle")}</h1><p class="lead">${latest ? u("resumeText") : u("homeText")}</p></div>${orb()}<button id="mainAction" class="primary" ${!latest && !S.enabled ? "disabled" : ""}>${latest ? (S.enabled ? t("resume") : t("view")) : u("talk")}</button>${S.sessions.some(s => !s.revoked && s.voice_state === "ready") ? `<button id="homeVoice" class="secondary">${icon("wave")}${t("myVoice")}</button>` : ""}<div class="home-caption">${icon(latest ? "history" : "mic")}${latest ? `${u("saved")} · ${fmt(latest.saved_audio_ms)}` : u("listeningHelp")}</div>${!S.enabled ? `<p class="status-note">${t("disabled")}</p>` : ""}<div class="prompt-card"><span>${u("promptLabel")}</span><blockquote>${u("prompt")}</blockquote><p>${u("promptNote")}</p></div></div><div class="home-secondary">${icon("shield")}<div><strong>${u("privacy")}</strong>${u("privacyText")}</div></div></section>${learningPanel({ lang: S.lang, journey: latest || {}, workflow: { voice_state: latest?.voice_state } })}</div>${S.config && !S.config.interview ? configurationCard(S.config) : ""}${S.sessions.length ? `<section class="history-section"><h2>${u("recent")}</h2>${sessionList(S.sessions.slice(0, 3))}</section>` : ""}`,
   );
   bind("#mainAction", () => (latest ? openSession(latest.id) : consent()));
+  bind("#homeVoice", showMyVoice);
   app
     .querySelectorAll("[data-session]")
     .forEach(
@@ -280,7 +283,16 @@ function renderHome() {
 function sessionList(sessions) {
   return `<ul class="session-list">${sessions.map((s, i) => `<li><div><strong>${u("savedSession")} ${i + 1}</strong><p>${s.revoked ? t("revoked") : t("saved")} · <span dir="ltr">${fmt(s.saved_audio_ms)}</span>${s.created ? ` · <span class="session-date">${esc(new Date(s.created).toLocaleDateString(S.lang === "ar" ? "ar-AE" : "en-GB", { day: "numeric", month: "short" }))}</span>` : ""}</p></div><button class="secondary" data-session="${esc(s.id)}">${t("open")}</button></li>`).join("")}</ul>`;
 }
+function showMyVoice() {
+  if (S.busy || S.call || S.capture?.stream || S.capture?.starting) {
+    notice(t("callAway"), true);
+    return;
+  }
+  stopSamples();
+  return openSavedVoice({ request, dialog, text: t, escape: esc });
+}
 function dialog(title, body) {
+  q("#workspaceDialog")?.close();
   q("#workspaceDialog")?.remove();
   const d = document.createElement("dialog");
   d.id = "workspaceDialog";
@@ -1041,6 +1053,7 @@ async function signout() {
   S.learning = null;
   S.learningError = false;
   learning.reset();
+  q("#workspaceDialog")?.close();
   q("#workspaceDialog")?.remove();
   clearSamples();
   login();
