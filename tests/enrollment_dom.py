@@ -86,7 +86,7 @@ FAKE_MEDIA = r"""
     }
   };
   window.RTCPeerConnection = class {
-    constructor() { this.connectionState = 'new'; }
+    constructor() { this.connectionState = 'new'; state.peer = this; }
     addTrack() {}
     createDataChannel() {
       this.channel = {readyState: 'open', send() {}, close() { this.readyState = 'closed'; }};
@@ -385,6 +385,18 @@ def main():
                 expect(page.locator("html")).to_have_attribute("lang", "ar")
                 expect(page.locator("html")).to_have_attribute("dir", "rtl")
                 sign_in_english()
+                page.screenshot(path=str(output / "conversation-home-desktop-en.png"), full_page=True)
+                page.locator("#navSettings").click()
+                expect(page.locator("#workspaceDialog")).to_be_visible()
+                page.keyboard.press("Escape")
+                expect(page.locator("#workspaceDialog")).to_have_count(0)
+                page.locator("#navHistory").click()
+                expect(page.locator("#workspaceDialog")).to_contain_text("A fresh start.")
+                page.locator("#closeDialog").click()
+                page.set_viewport_size({"width": 390, "height": 844})
+                assert_no_overflow()
+                page.screenshot(path=str(output / "conversation-home-mobile-en.png"), full_page=True)
+                page.set_viewport_size({"width": 1280, "height": 960})
                 page.locator("#mainAction").click()
                 expect(page.locator("#consentForm")).to_be_visible()
                 for selector in ("#own", "#record", "#external", "#clone", "#preview"):
@@ -402,6 +414,20 @@ def main():
 
                 page.locator("#connect").click()
                 expect(page.locator("#orb")).to_have_class(re.compile(r"\blive\b"))
+                page.evaluate("""() => {
+                  const send = event => window.__syntheticMedia.peer.channel.onmessage({data:JSON.stringify(event)});
+                  send({type:'conversation.item.input_audio_transcription.delta', item_id:'display-only', delta:'Ask about '});
+                  send({type:'conversation.item.input_audio_transcription.completed', item_id:'display-only', transcript:'Ask about their priorities. <script>alert(1)</script>'});
+                  send({type:'conversation.item.input_audio_transcription.completed', item_id:'display-only', transcript:'duplicate final'});
+                  send({type:'response.output_audio_transcript.done', item_id:'assistant-display', transcript:'What would you ask first?'});
+                  send({type:'output_audio_buffer.started'});
+                }""")
+                expect(page.locator("#orb")).to_have_attribute("data-speaker", "raneen")
+                expect(page.locator(".transcript-turn.trainer")).to_have_count(1)
+                expect(page.locator(".transcript-turn.trainer")).to_contain_text("Ask about their priorities.")
+                assert page.locator("#conversationFeed script").count() == 0
+                page.evaluate("window.__syntheticMedia.peer.channel.onmessage({data:JSON.stringify({type:'input_audio_buffer.speech_started'})})")
+                expect(page.locator("#orb")).to_have_attribute("data-speaker", "trainer")
                 page.wait_for_function("window.__syntheticMedia.recorders.some(r => r.state === 'recording')")
                 fake.interview_close_failures = 1
                 with page.expect_response("**/webrtc-close") as closing_interview:
@@ -470,6 +496,13 @@ def main():
                 expect(page.locator("#approveVoice")).to_be_disabled()
                 assert len(fake.clone_calls) == 1
                 assert len(fake.speech_calls) == 3
+                page.locator("#deferVoice").click()
+                expect(page.locator("#connect")).to_be_visible()
+                assert app.state.store.one("SELECT COUNT(*) AS n FROM enrollment_voice_approvals")["n"] == 0
+                assert page.evaluate("window.__syntheticMedia.active") == 0
+                page.locator("#finish").click()
+                expect(page.locator("#sample-question")).to_be_visible(timeout=30000)
+                assert len(fake.clone_calls) == 1, "Deferring a voice must not create another clone"
                 for index, kind in enumerate(("question", "number", "correction")):
                     sample = page.locator("#sample-" + kind)
                     sample.evaluate("async audio => { audio.muted = true; await audio.play(); }")
@@ -685,9 +718,9 @@ def main():
                 def open_failed_interview(expected_clone_count=0, expected_preview_count=0):
                     page.reload()
                     sign_in_english()
-                    history = page.locator("details").filter(has=page.locator('[data-session="' + failed_session + '"]'))
-                    history.locator("summary").click()
-                    page.locator('[data-session="' + failed_session + '"]').click()
+                    page.locator("#navHistory").click()
+                    expect(page.locator("#workspaceDialog")).to_be_visible()
+                    page.locator('#workspaceDialog [data-session="' + failed_session + '"]').click()
                     note = page.locator(".preparation-card .status-note[role=status]")
                     expect(note).to_contain_text("ElevenLabs did not accept the API key.")
                     expect(note).to_contain_text("your recording is saved.")
