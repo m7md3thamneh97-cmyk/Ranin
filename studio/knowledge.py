@@ -256,6 +256,20 @@ class SqliteKnowledgeProvider(KnowledgeProvider):
                 (document_id, body.version_key),
             ).fetchone()
             if existing:
+                expected_modified = body.modified_at.isoformat() if body.modified_at else None
+                expected_sha = body.content_sha256.lower() if body.content_sha256 else None
+                same_version = (
+                    existing["mime_type"] == body.mime_type
+                    and existing["size_bytes"] == body.size_bytes
+                    and existing["modified_at"] == expected_modified
+                    and existing["content_sha256"] == expected_sha
+                    and existing["metadata_json"] == metadata
+                )
+                if not same_version:
+                    raise HTTPException(
+                        409,
+                        "Source version key was reused with different immutable version metadata.",
+                    )
                 return {
                     "document_id": document_id,
                     "document_version_id": existing["id"],
@@ -446,15 +460,28 @@ class SqliteKnowledgeProvider(KnowledgeProvider):
             )
             if not unit or unit["document_version_id"] != body.document_version_id:
                 raise HTTPException(422, "Asset unit must belong to the same document version.")
+        metadata = bounded_json(body.metadata)
+        existing = self.store.one(
+            "SELECT * FROM knowledge_assets WHERE document_version_id=? "
+            "AND COALESCE(unit_id,'')=COALESCE(?, '') AND asset_type=? AND source_locator=?",
+            (body.document_version_id, body.unit_id, body.asset_type, body.source_locator),
+        )
+        if existing:
+            if existing["summary"] != body.summary or existing["metadata_json"] != metadata:
+                raise HTTPException(
+                    409,
+                    "This immutable visual asset locator already exists with different content.",
+                )
+            return {"id": existing["id"], "idempotent": True}
         ident = uid()
         self.store.execute(
             "INSERT INTO knowledge_assets VALUES(?,?,?,?,?,?,?,?)",
             (
                 ident, body.document_version_id, body.unit_id, body.asset_type,
-                body.source_locator, body.summary, bounded_json(body.metadata), now(),
+                body.source_locator, body.summary, metadata, now(),
             ),
         )
-        return {"id": ident}
+        return {"id": ident, "idempotent": False}
 
     def add_relation(self, body: RelationInput):
         if body.from_document_id == body.to_document_id:
@@ -750,6 +777,7 @@ def install(app) -> None:
         store.audit(user["id"], "knowledge_asset_recorded", result["id"], {
             "document_version_id": body.document_version_id,
             "asset_type": body.asset_type,
+            "idempotent": result["idempotent"],
         })
         return result
 
