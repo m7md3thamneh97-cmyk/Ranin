@@ -432,10 +432,8 @@ def main():
             # same-origin sanitized relay can drive speaker capture and labels.
             page.evaluate("window.__emitDaily({type:'speech-update',role:'user',status:'started'})")
             expect(page.locator("#experience")).to_have_attribute("data-speaking", "")
-            page.evaluate("window.__emitRelay({type:'speech-update',role:'user',status:'started'})")
-            page.wait_for_function("document.querySelector('#progress') !== null")
             with page.expect_response("**/chunks/0", timeout=15000):
-                page.wait_for_timeout(4500)
+                page.evaluate("window.__emitRelay({type:'speech-update',role:'user',status:'started'})")
             assert len(fixture.chunks) >= 1
             page.evaluate("window.__emitRelay({type:'speech-update',role:'user',status:'stopped'})")
 
@@ -464,8 +462,17 @@ def main():
             assert fixture.ended == 1
             expect(page.locator("#savedVoice")).to_be_visible()
             expect(page.locator("#voicePreview")).to_have_attribute("src", "/api/becoming/sessions/" + SESSION_ID + "/voice-check")
-            page.locator("#voicePreview").evaluate("async audio => { audio.muted = true; await audio.play(); }")
-            page.wait_for_function("document.querySelector('#voicePreview').ended")
+            # The native ended event establishes decoding/playback without
+            # Playwright's string-predicate poller invoking page-level eval,
+            # which the real application CSP intentionally rejects.
+            page.locator("#voicePreview").evaluate("""audio => new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('synthetic_preview_timeout')), 5000);
+                const fail = () => { clearTimeout(timer); reject(new Error('synthetic_preview_decode_failed')); };
+                audio.addEventListener('ended', () => { clearTimeout(timer); resolve(); }, {once: true});
+                audio.addEventListener('error', fail, {once: true});
+                audio.muted = true;
+                audio.play().catch(fail);
+            })""")
             # Retained private voice access survives reload without automatically
             # restarting a microphone or creating another provider call.
             page.reload(wait_until="networkidle")
