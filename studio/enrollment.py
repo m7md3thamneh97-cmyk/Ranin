@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .app import now, token_hash, uid
 from .enrollment_journey import journey_summary, recovery_summary
+from .vapi_errors import rejection_hint
 from .enrollment_provider_errors import (
     KNOWN_REJECTIONS, provider_failure, response_diagnostics, retryable_clone, sanitize_diagnostics, stored_failure,
 )
@@ -410,7 +411,7 @@ class Providers:
         if r.status_code >= 500:
             raise ProviderError(f"Vapi returned HTTP {r.status_code}.", uncertain=method != "GET")
         if r.status_code >= 300:
-            raise ProviderError(f"Vapi returned HTTP {r.status_code}.")
+            raise ProviderError(f"Vapi returned HTTP {r.status_code}." + rejection_hint(r))
         try:
             return r.json()
         except ValueError as exc:
