@@ -108,7 +108,7 @@ test('Daily rejects non-provider destinations and repeated call starts',async()=
   const call=new BecomingCall({Daily:fakeDaily().sdk});await call.start({url:'https://raneen.daily.co/room',microphoneTrack:{kind:'audio'}});await assert.rejects(call.start({url:'https://raneen.daily.co/room',microphoneTrack:{kind:'audio'}}),/call_already_started/);await call.stop();
 });
 
-function browserFixture({permissionDenied=false,configured=true,serverStates=['COLLECTING_VOICE'],savedSession=null,retentionDays=7,debug=false}={}){
+function browserFixture({permissionDenied=false,configured=true,serverStates=['COLLECTING_VOICE'],savedSession=null,serverSnapshot=null,retentionDays=7,debug=false}={}){
   const elements=new Map(),requests=[],listeners=new Map(),daily=fakeDaily(),sources=[];let stopped=0,closed=0,gets=0;const currentId=savedSession??'b'.repeat(32);
   const element=id=>{if(!elements.has(id))elements.set(id,{id,dataset:{},textContent:'',hidden:false,checked:false,disabled:false,setAttribute(){},getAttribute(name){return this[name];},removeAttribute(name){delete this[name];},pause(){},querySelector(){return element(id+'Label');}});return elements.get(id);};
   const track={kind:'audio',stop:()=>stopped++,getSettings:()=>({sampleRate:48000,echoCancellation:true})};
@@ -125,9 +125,9 @@ function browserFixture({permissionDenied=false,configured=true,serverStates=['C
   globalThis.fetch=async(url,options={})=>{
     requests.push({url,options});let value={};
     if(url.endsWith('/readiness'))value={enabled:true,configured:configured?{vapi:true,elevenlabs:true,template:true}:{vapi:true,elevenlabs:false,template:true},minimum_speech_seconds:30,max_duration_seconds:90,retention_days:retentionDays};
-    else if(url==='/api/becoming/sessions')value={id:currentId,capability:'synthetic-private-capability',state:'IDLE'};
+    else if(url==='/api/becoming/sessions')value={id:'b'.repeat(32),capability:'synthetic-private-capability',state:'IDLE'};
     else if(url.endsWith('/call'))value={call_id:'synthetic-call',web_call_url:'https://raneen.daily.co/synthetic-room',call_token:'synthetic-room-token',max_duration_seconds:90};
-    else if(url==='/api/becoming/sessions/'+currentId&&options.method==='GET')value={id:currentId,state:serverStates[Math.min(gets++,serverStates.length-1)],eligible_audio_seconds:31,voice_id:'synthetic-voice',voice_ready:true};
+    else if(url==='/api/becoming/sessions/'+currentId&&options.method==='GET')value={id:currentId,state:serverStates[Math.min(gets++,serverStates.length-1)],eligible_audio_seconds:31,voice_id:'synthetic-voice',voice_ready:true,...serverSnapshot};
     else if(url.endsWith('/end'))value={state:'ENDED'};
     else if(url.endsWith('/revoke'))value={state:'REVOKED'};
     return {ok:true,status:200,json:async()=>value};
@@ -178,6 +178,30 @@ test('refresh restores only an id through its cookie and never starts another pa
   assert.deepEqual([...fixture.storage.values()],[id]);
   assert.ok(fixture.requests.every(request=>!request.options.headers.Authorization));
   assert.equal(fixture.element('savedVoice').hidden,false);assert.equal(fixture.element('voicePreview').src,'/api/becoming/sessions/'+id+'/voice-check');await fixture.cleanup();
+});
+
+const rejectedEmptyCall={state:'ENDED',call_state:'failed',failure:{stage:'call'},eligible_audio_seconds:0,voice_id:null,voice_ready:false,telemetry:{cleanup:'complete'}};
+test('a restored definite empty rejection offers a consented manual retry with a new session',async()=>{
+  const id='a'.repeat(32),fixture=browserFixture({savedSession:id,serverSnapshot:rejectedEmptyCall});await fixture.load();
+  assert.equal(fixture.element('startControls').hidden,false);
+  assert.equal(fixture.element('create').disabled,true,'fresh consent is required');
+  assert.equal(fixture.daily.calls.length,0,'refresh creates no call');
+  assert.ok(!fixture.requests.some(request=>request.url.endsWith('/call')));
+  await fixture.create();
+  assert.equal(fixture.requests.filter(request=>request.url==='/api/becoming/sessions').length,1);
+  assert.equal(fixture.requests.filter(request=>request.url.endsWith('/call')).length,1);
+  assert.ok(fixture.requests.some(request=>request.url==='/api/becoming/sessions/'+'b'.repeat(32)+'/call'));
+  assert.ok(!fixture.requests.some(request=>request.url==='/api/becoming/sessions/'+id+'/call'));
+  await fixture.cleanup();
+});
+
+test('uncertain calls, retained media and unconfirmed cleanup never offer a retry',async()=>{
+  for(const change of [{call_state:'outcome_unknown'},{eligible_audio_seconds:1},{voice_id:'synthetic-voice'},{voice_ready:true},{telemetry:{cleanup:'pending'}}]){
+    const fixture=browserFixture({savedSession:'a'.repeat(32),serverSnapshot:{...rejectedEmptyCall,...change}});await fixture.load();
+    assert.equal(fixture.element('startControls').hidden,true);await fixture.create();
+    assert.ok(!fixture.requests.some(request=>request.url==='/api/becoming/sessions'||request.url.endsWith('/call')));
+    await fixture.cleanup();
+  }
 });
 
 test('subminimum final PCM fragments are excluded rather than uploaded as misleading duration',async()=>{
